@@ -17,11 +17,7 @@ export default function UploadPage() {
   const [isPublishing, setIsPublishing] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // --- TAHAP 65.0: STATE METADATA LAPORAN SISWA ---
-  const [studentName, setStudentName] = useState('');
-  const [programId, setProgramId] = useState('');
-  const [meetingNumber, setMeetingNumber] = useState<number | ''>('');
-  const [sessionDate, setSessionDate] = useState(new Date().toISOString().split('T')[0]);
+  // --- TAHAP 65.0: STATE METADATA LAPORAN SISWA (PER-FILE ISOLATED) ---
   const [programsList, setProgramsList] = useState<any[]>([]);
 
   // Fetch daftar program dari database saat komponen dimuat
@@ -30,23 +26,6 @@ export default function UploadPage() {
       .then(res => setProgramsList(res.data))
       .catch(err => console.error('[UPLOAD FORM 65.0] Gagal memuat daftar program:', err));
   }, []);
-
-  // Auto-fetch rekomendasi nomor pertemuan saat nama, program, atau tanggal berubah
-  useEffect(() => {
-    if (studentName.trim() && programId) {
-      api.post('/students/next-meeting', {
-        studentName: studentName.trim(),
-        programId: parseInt(programId.toString(), 10),
-        sessionDate
-      })
-      .then(res => {
-        if (res.data && res.data.recommendedMeeting) {
-          setMeetingNumber(res.data.recommendedMeeting);
-        }
-      })
-      .catch(err => console.error('[UPLOAD FORM 65.0] Gagal fetch rekomendasi pertemuan:', err));
-    }
-  }, [studentName, programId, sessionDate]);
 
   useEffect(() => {
     // When component mounts, check for existing draft.
@@ -149,6 +128,10 @@ const generateLocalVideoThumbnail = (file: File): Promise<string> => {
           sizeFormatted: (file.size / (1024 * 1024)).toFixed(1) + ' MB',
           localPreviewUrl: localPreviewUrl,
           thumbnailUrl: generatedThumb || localPreviewUrl,
+          studentName: '',
+          programId: '',
+          meetingNumber: '',
+          sessionDate: new Date().toISOString().split('T')[0]
         };
       })
     );
@@ -165,6 +148,10 @@ const generateLocalVideoThumbnail = (file: File): Promise<string> => {
       visibility: 'public',
       categoryId: '1',
       allowDownload: true,
+      studentName: '',
+      programId: '',
+      meetingNumber: '',
+      sessionDate: new Date().toISOString().split('T')[0]
     };
     setFiles(prev => [...prev, newFile]);
   };
@@ -174,7 +161,32 @@ const generateLocalVideoThumbnail = (file: File): Promise<string> => {
   };
 
   const updateFileData = (id: string, data: any) => {
-    setFiles(files.map(f => f.id === id ? { ...f, ...data } : f));
+    setFiles(prev => prev.map(f => {
+      if (f.id !== id) return f;
+      const updated = { ...f, ...data };
+
+      // Auto-fetch rekomendasi pertemuan khusus untuk kartu video ini jika metadata berubah
+      if (data.studentName !== undefined || data.programId !== undefined || data.sessionDate !== undefined) {
+        const sName = (updated.studentName || '').trim();
+        const pId = updated.programId;
+        const sDate = updated.sessionDate;
+
+        if (sName && pId) {
+          api.post('/students/next-meeting', {
+            studentName: sName,
+            programId: parseInt(pId.toString(), 10),
+            sessionDate: sDate
+          })
+          .then(res => {
+            if (res.data && res.data.recommendedMeeting) {
+              setFiles(curr => curr.map(item => item.id === id ? { ...item, meetingNumber: res.data.recommendedMeeting } : item));
+            }
+          })
+          .catch(err => console.error('[UPLOAD FORM] Gagal fetch rekomendasi pertemuan:', err));
+        }
+      }
+      return updated;
+    }));
   };
 
 // --- REALTIME ACCUMULATIVE CHUNK UPLOADER (TAHAP 54.8) ---
@@ -259,15 +271,16 @@ const updateTaskProgress = (taskId: string, patch: Partial<any>) => {
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-          title: fileObj.title?.trim() || studentName.trim() || fileObj.file.name || 'Laporan Pembelajaran',
+          title: fileObj.title?.trim() || fileObj.studentName?.trim() || fileObj.file.name || 'Laporan Pembelajaran',
           description: fileObj.description || '',
           visibility: fileObj.visibility || 'public',
           categoryId: fileObj.categoryId || '1',
           allowDownload: fileObj.allowDownload,
-          student_name: studentName.trim(),
-          program_id: programId.toString(),
-          meeting_number: meetingNumber.toString(),
-          session_date: sessionDate
+          student_name: (fileObj.studentName || '').trim(),
+          program_id: (fileObj.programId || '').toString(),
+          meeting_number: (fileObj.meetingNumber || '').toString(),
+          session_date: fileObj.sessionDate || new Date().toISOString().split('T')[0],
+          uploadId: uploadId
         })
       });
       
@@ -480,9 +493,9 @@ const updateTaskProgress = (taskId: string, patch: Partial<any>) => {
                         <input
                           type="text"
                           required
-                          placeholder="Contoh: Syarif"
-                          value={studentName}
-                          onChange={(e) => setStudentName(e.target.value)}
+                          placeholder="Nama Siswa"
+                          value={fileObj.studentName || ''}
+                          onChange={(e) => updateFileData(fileObj.id, { studentName: e.target.value })}
                           className="w-full bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-2xl p-4 text-sm font-bold focus:outline-none focus:border-brand-600 transition-all"
                         />
                       </div>
@@ -494,8 +507,8 @@ const updateTaskProgress = (taskId: string, patch: Partial<any>) => {
                         {/* TAHAP 72.0: FIX DROPDOWN DARK MODE VISIBILITY */}
                         <select
                           required
-                          value={programId}
-                          onChange={(e) => setProgramId(e.target.value)}
+                          value={fileObj.programId || ''}
+                          onChange={(e) => updateFileData(fileObj.id, { programId: e.target.value })}
                           className="w-full bg-zinc-900 text-white border border-zinc-700/80 rounded-2xl p-4 text-sm font-bold focus:outline-none focus:border-brand-600 transition-all appearance-none cursor-pointer"
                           style={{ colorScheme: 'dark' }}
                         >
@@ -516,8 +529,8 @@ const updateTaskProgress = (taskId: string, patch: Partial<any>) => {
                           type="number"
                           min="1"
                           required
-                          value={meetingNumber}
-                          onChange={(e) => setMeetingNumber(parseInt(e.target.value, 10) || '')}
+                          value={fileObj.meetingNumber || ''}
+                          onChange={(e) => updateFileData(fileObj.id, { meetingNumber: parseInt(e.target.value, 10) || '' })}
                           className="w-full bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-2xl p-4 text-sm font-bold focus:outline-none focus:border-brand-600 transition-all"
                         />
                       </div>
@@ -528,8 +541,8 @@ const updateTaskProgress = (taskId: string, patch: Partial<any>) => {
                         </label>
                         <input
                           type="date"
-                          value={sessionDate}
-                          onChange={(e) => setSessionDate(e.target.value)}
+                          value={fileObj.sessionDate || new Date().toISOString().split('T')[0]}
+                          onChange={(e) => updateFileData(fileObj.id, { sessionDate: e.target.value })}
                           className="w-full bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-2xl p-4 text-sm font-bold focus:outline-none focus:border-brand-600 transition-all"
                         />
                       </div>
