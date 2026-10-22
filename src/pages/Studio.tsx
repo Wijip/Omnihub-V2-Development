@@ -192,8 +192,8 @@ export default function StudioPage() {
           return task;
         }
 
-        // STAGE 77.5: POLLING SYNC UNTUK SEMUA TASK YANG BELUM READY
-        if (task.status !== 'ready' && task.status !== 'error') {
+        // STAGE 77.5: POLLING SYNC HANYA UNTUK TASK YANG SUDAH SELESAI UPLOAD (MERGING, WAITING, PROCESSING)
+        if (['waiting', 'processing', 'merging'].includes(task.status)) {
           try {
             const res = await fetch(`/api/video/encoding-status/${task.id}`);
             if (res.ok) {
@@ -213,6 +213,12 @@ export default function StudioPage() {
                 const cappedEnc = Math.min(99, Math.max(task.encodingProgress || 0, serverEnc));
                 if (cappedEnc !== task.encodingProgress || task.status !== 'processing') {
                   task.encodingProgress = cappedEnc;
+                  stateChanged = true;
+                }
+              } else if (data.status === 'waiting') {
+                if (task.status !== 'waiting') {
+                  task.status = 'waiting';
+                  task.uploadProgress = 100;
                   stateChanged = true;
                 }
               }
@@ -578,8 +584,9 @@ export default function StudioPage() {
 
           const totalCount = tasks.length;
           const completedCount = tasks.filter((t: any) => t.status === 'ready').length;
-          const activeCount = tasks.filter((t: any) => t.status === 'uploading' || t.status === 'processing').length;
-          const queuedCount = tasks.filter((t: any) => t.status === 'queued').length;
+          const uploadingCount = tasks.filter((t: any) => t.status === 'uploading' || t.status === 'merging').length;
+          const encodingCount = tasks.filter((t: any) => t.status === 'processing').length;
+          const queuedCount = tasks.filter((t: any) => t.status === 'queued' || t.status === 'waiting').length;
 
           return (
             <div className="bg-neutral-900 border border-blue-500/40 rounded-2xl p-5 mb-8 shadow-2xl">
@@ -589,10 +596,10 @@ export default function StudioPage() {
                   <span className="text-2xl animate-spin">🔄</span>
                   <div>
                     <h3 className="font-black text-white text-base">
-                      Memproses Pengunggahan Masal ({completedCount}/{totalCount} Selesai)
+                      Pipeline Unggahan & Transcoding ({completedCount}/{totalCount} Selesai)
                     </h3>
                     <p className="text-xs text-neutral-400">
-                      {activeCount} Aktif | {queuedCount} Mengantre | {completedCount} Siap
+                      {uploadingCount > 0 ? `${uploadingCount} Upload/Merge` : '0 Upload'} | {encodingCount > 0 ? `${encodingCount} Encoding GPU` : '0 Encoding'} | {queuedCount} Mengantre | {completedCount} Siap
                     </p>
                   </div>
                 </div>
@@ -627,12 +634,18 @@ export default function StudioPage() {
                       <div className="flex items-center gap-2">
                         <span className={`text-[10px] font-black px-2.5 py-0.5 rounded-full uppercase tracking-wider ${
                           task.status === 'uploading' ? 'bg-blue-500/20 text-blue-400 border border-blue-500/30 animate-pulse' :
+                          task.status === 'merging' ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30 animate-pulse' :
+                          task.status === 'waiting' ? 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30' :
                           task.status === 'processing' ? 'bg-purple-500/20 text-purple-400 border border-purple-500/30 animate-pulse' :
                           task.status === 'ready' ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 shadow-[0_0_8px_rgba(16,185,129,0.4)]' :
                           task.status === 'error' ? 'bg-red-500/20 text-red-400 border border-red-500/30 animate-bounce' :
-                          'bg-neutral-800 text-neutral-400'
+                          'bg-neutral-800 text-neutral-400 border border-neutral-700'
                         }`}>
-                          {task.status === 'queued' ? '⏳ Mengantre' : 
+                          {task.status === 'queued' ? '⏳ Antre Upload' : 
+                           task.status === 'uploading' ? '📤 Mengunggah...' :
+                           task.status === 'merging' ? '🧩 Menyatukan Chunks...' :
+                           task.status === 'waiting' ? '⏳ Antre Encoding (GPU)' :
+                           task.status === 'processing' ? '⚡ Encoding GPU (NVENC)...' :
                            task.status === 'ready' ? '✅ SELESAI' :
                            task.status === 'error' ? '❌ GAGAL' : 
                            task.status}

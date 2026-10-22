@@ -2,6 +2,8 @@ import blessed from 'blessed';
 // @ts-ignore (Karena modul contrib terkadang tidak memiliki deklarasi tipe yang lengkap)
 import contrib from 'blessed-contrib';
 import os from 'os';
+import path from 'path';
+import fs from 'fs';
 import { exec, spawn } from 'child_process';
 
 export const screen = blessed.screen({ smartCSR: true, title: 'OmniHub Server Control Center' });
@@ -64,7 +66,7 @@ screen.key(['3'], () => {
 
 // --- TOMBOL [4] RESTART SERVER (STAGE 1.10 CLEAN REBOOT) ---
 screen.key(['4'], () => {
-  logBox.log('[SYSTEM] 🔄 Memulai Ulang (Restart) Server OmniHub...');
+  logBox.log('{cyan-fg}[SYSTEM] 🔄 Memulai Ulang (Restart) Server OmniHub...{/cyan-fg}');
   screen.render();
   
   setTimeout(() => {
@@ -77,16 +79,36 @@ screen.key(['4'], () => {
 
     const isWindows = process.platform === 'win32';
 
-    // Re-spawn proses server dengan shell wrapper untuk automatic reboot
-    const child = spawn(process.argv[0], process.argv.slice(1), {
-      cwd: process.cwd(),
-      detached: true,
-      stdio: 'inherit',
-      shell: isWindows
-    });
+    // 1. Jika dijalankan melalui run_dev.bat (ada environment OMNIHUB_MANAGED_RESTART)
+    if (process.env.OMNIHUB_MANAGED_RESTART === '1') {
+      console.log('\n[SYSTEM] Sinyal reboot dikirim (Exit Code 42). Memulai ulang proses...');
+      process.exit(42);
+      return;
+    }
 
-    child.unref();
-    process.exit(0);
+    // 2. Fallback jika server dijalankan mandiri di luar run_dev.bat:
+    const batPath = path.resolve(process.cwd(), 'run_dev.bat');
+    if (isWindows && fs.existsSync(batPath)) {
+      console.log('\n[SYSTEM] Menjalankan kembali via run_dev.bat...');
+      const child = spawn('cmd.exe', ['/c', 'start', '""', 'run_dev.bat'], {
+        cwd: process.cwd(),
+        detached: true,
+        stdio: 'ignore'
+      });
+      child.unref();
+      process.exit(0);
+    } else {
+      console.log('\n[SYSTEM] Menjalankan kembali via npm run dev...');
+      const npmCmd = isWindows ? 'npm.cmd' : 'npm';
+      const child = spawn(npmCmd, ['run', 'dev'], {
+        cwd: process.cwd(),
+        detached: true,
+        stdio: 'inherit',
+        shell: isWindows
+      });
+      child.unref();
+      process.exit(0);
+    }
   }, 500);
 });
 

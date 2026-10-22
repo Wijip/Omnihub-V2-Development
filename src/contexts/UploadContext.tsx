@@ -87,7 +87,7 @@ export const UploadProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     });
   };
 
-// Upload Queue Manager: Max 2 parallel uploads
+// Upload Queue Manager: Strict 1 sequential upload & merge at a time
   const queueCheckInProgress = React.useRef(false);
   const activeNetworkHash = React.useRef(new Set<string>());
 
@@ -97,7 +97,7 @@ export const UploadProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     // activeUploads only tracks things actively consuming network (not backend GPU/Waiting tasks)
     const activeUploads = tasks.filter(t => ['uploading', 'merging'].includes(t.status)).length;
     
-    if (activeUploads < 2) {
+    if (activeUploads < 1) {
       const nextTask = tasks.find(t => t.status === 'pending');
       if (nextTask) {
         queueCheckInProgress.current = true;

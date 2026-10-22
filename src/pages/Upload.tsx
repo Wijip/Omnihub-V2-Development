@@ -221,14 +221,29 @@ const uploadFileInChunks = async (file: File, taskId: string, videoId: string) =
           const currentTotalLoaded = totalUploadedBytes + currentChunkLoaded;
           const overallProgress = Math.min(99, Math.round((currentTotalLoaded / file.size) * 100));
 
-          // Sync langsung ke localStorage & trigger State update
-          updateTaskProgress(taskId, { uploadProgress: overallProgress, status: 'uploading' });
+          // Jika ini chunk terakhir dan seluruh byte selesai dikirim, tandai merging (server sedang menyatukan chunk)
+          if (index === totalChunks - 1 && currentChunkLoaded >= e.total) {
+            updateTaskProgress(taskId, { uploadProgress: 100, status: 'merging' });
+          } else {
+            updateTaskProgress(taskId, { uploadProgress: overallProgress, status: 'uploading' });
+          }
         }
       };
 
       xhr.onload = () => {
         if (xhr.status >= 200 && xhr.status < 300) {
           totalUploadedBytes += (end - start);
+          if (index === totalChunks - 1) {
+            let nextStatus = 'waiting';
+            try {
+              const resData = JSON.parse(xhr.responseText);
+              if (resData.status) nextStatus = resData.status;
+            } catch (err) {
+              /* ignore */
+            }
+            // Selesai menyatukan chunk di server -> pindah ke status yang sesuai (waiting / processing)
+            updateTaskProgress(taskId, { uploadProgress: 100, status: nextStatus });
+          }
           resolve();
         } else {
           reject(new Error(`Chunk ${index} failed with status ${xhr.status}`));
@@ -239,9 +254,6 @@ const uploadFileInChunks = async (file: File, taskId: string, videoId: string) =
       xhr.send(formData);
     });
   }
-
-  // Upload Selesai 100% -> Pindah ke Fase Processing
-  updateTaskProgress(taskId, { uploadProgress: 100, status: 'processing' });
 };
 
 // Helper Update Task
@@ -306,7 +318,7 @@ const updateTaskProgress = (taskId: string, patch: Partial<any>) => {
     }
 
     try {
-      // --- BATCH MULTI-FILE UPLOAD QUEUE SYSTEM (TAHAP 52) ---
+      // --- BATCH MULTI-FILE UPLOAD QUEUE SYSTEM (PIPELINED 1-BY-1) ---
       const newTasks = files.map((fileObj, idx) => ({
         id: `up_${Date.now()}_${idx}`,
         fileRef: fileObj,
@@ -315,21 +327,20 @@ const updateTaskProgress = (taskId: string, patch: Partial<any>) => {
         fileSize: fileObj.file.size,
         uploadProgress: 0,
         encodingProgress: 0,
-        status: idx < 2 ? 'uploading' : 'queued'
+        status: idx === 0 ? 'uploading' : 'queued'
       }));
 
       const existingTasks = JSON.parse(localStorage.getItem('active_upload_tasks') || '[]');
       const combinedTasks = [...existingTasks, ...newTasks.map(({ fileRef, ...meta }) => meta)];
       localStorage.setItem('active_upload_tasks', JSON.stringify(combinedTasks));
+      window.dispatchEvent(new Event('upload_task_updated'));
 
       const startQueueWorker = async (tasks: any[]) => {
-        let active = 0;
         let index = 0;
 
         const processNext = async () => {
           if (index >= tasks.length) return;
           const task = tasks[index++];
-          active++;
           
           try {
             const allTasks = JSON.parse(localStorage.getItem('active_upload_tasks') || '[]');
@@ -337,20 +348,21 @@ const updateTaskProgress = (taskId: string, patch: Partial<any>) => {
             if (tIdx > -1) {
                allTasks[tIdx].status = 'uploading';
                localStorage.setItem('active_upload_tasks', JSON.stringify(allTasks));
+               window.dispatchEvent(new Event('upload_task_updated'));
             }
             await startBackgroundUpload(task.fileRef, task.id);
           } catch(e) {
             console.error('Queue failed for', task.id);
+            updateTaskProgress(task.id, { status: 'error', error: 'Upload failed' });
           } finally {
-            active--;
+            // Setelah penggabungan chunk task ini selesai dan masuk proses/antrean encoding di server,
+            // barulah video berikutnya dalam antrean mulai mengunggah
             processNext();
           }
         };
 
-        const maxConcurrency = 2;
-        for (let i = 0; i < maxConcurrency && i < tasks.length; i++) {
-           processNext();
-        }
+        // Mulai tepat 1 pipeline upload + chunk merge secara berurutan
+        processNext();
       };
 
       startQueueWorker(newTasks);

@@ -288,6 +288,7 @@ const videoQueue = new PQueue({ concurrency: 1 });
 // --- FFMPEG NVENC BATCH QUEUE WORKER (TAHAP 52) ---
 const ffmpegTranscodeQueue: Array<() => Promise<void>> = [];
 let isTranscodingActive = false;
+let currentTranscodingVideoId: number | null = null;
 
 const processNextInFFmpegQueue = async () => {
   if (isTranscodingActive || ffmpegTranscodeQueue.length === 0) return;
@@ -299,6 +300,7 @@ const processNextInFFmpegQueue = async () => {
     } catch (e) {
       console.error('[FFMPEG QUEUE ERROR]:', e);
     } finally {
+      currentTranscodingVideoId = null;
       isTranscodingActive = false;
       processNextInFFmpegQueue(); // Lanjut ke antrean berikutnya
     }
@@ -723,6 +725,7 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
       let highestResUrl = '';
       let highestResWidth = 0;
 
+      currentTranscodingVideoId = videoId;
       await db.execute('UPDATE Videos SET status = ? WHERE id = ?', ['processing', videoId]);
       io.emit('video-progress-' + videoId, { status: 'processing', progress: 0 });
 
@@ -1122,6 +1125,7 @@ Aturan Penulisan:
 
       // MANDATORY: Emit completion signal to UI ONLY AFTER everything is finished
       io.emit('video-progress-' + videoId, { status: 'ready', progress: 100 });
+      currentTranscodingVideoId = null;
       
       // GUARANTEED RESOLVE explicitly to release the PQueue lock!
       return resolveQueue();
@@ -1136,6 +1140,7 @@ Aturan Penulisan:
         try { fs.unlinkSync(activeInputPath); } catch (e) { /* ignore */ }
       }
       
+      currentTranscodingVideoId = null;
       // Important to call resolveQueue even on error to unblock PQueue
       return resolveQueue();
     }
@@ -1624,18 +1629,24 @@ app.get('/api/video/encoding-status/:uploadId', async (req, res) => {
   const progress = encodingProgressMap.get(uploadId) || 0;
 
   try {
-    const [rows]: any = await db.query('SELECT status FROM videos WHERE upload_id = ? OR title LIKE ?', [uploadId, `%${uploadId}%`]);
-    const dbStatus = rows && rows.length > 0 ? rows[0].status : 'processing';
+    const [rows]: any = await db.query('SELECT status FROM Videos WHERE upload_id = ? OR title LIKE ?', [uploadId, `%${uploadId}%`]);
+    if (!rows || rows.length === 0) {
+      return res.json({ encodingProgress: 0, status: 'queued' });
+    }
+    const dbStatus = rows[0].status;
 
-    // Jika progress belum 100%, paksa dbStatus tetap 'processing' di respons API
-    const finalStatus = progress < 100 ? 'processing' : dbStatus;
+    // Jika dbStatus ready tapi progress belum 100%, jaga status tetap processing
+    let finalStatus = dbStatus;
+    if (dbStatus === 'ready' && progress < 100) {
+      finalStatus = 'processing';
+    }
 
     res.json({ 
       encodingProgress: progress,
       status: finalStatus
     });
   } catch (err) {
-    res.json({ encodingProgress: progress, status: 'processing' });
+    res.json({ encodingProgress: progress, status: 'queued' });
   }
 });
 
@@ -1732,9 +1743,13 @@ app.post('/api/upload/chunk', authenticate, upload.single('chunk'), async (req: 
           });
           processNextInFFmpegQueue();
         }
-        
-        // INSTANTLY return response so React releases the network slot without hanging
-        return res.json({ status: 'waiting' });
+
+        // Clear active merge lock
+        activeMerges.delete(lockKey);
+
+        // INSTANTLY return response with accurate initial status
+        const initialStatus = (currentTranscodingVideoId === vidIdInt) ? 'processing' : 'waiting';
+        return res.json({ status: initialStatus });
       });
       
     } else {
