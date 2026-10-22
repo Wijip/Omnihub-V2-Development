@@ -10,7 +10,7 @@
     "dev": "tsx server.ts",
     "build": "vite build",
     "preview": "vite preview",
-    "clean": "rm -rf dist",
+    "clean": "node -e \"const fs = require('fs'); if (fs.existsSync('dist')) fs.rmSync('dist', { recursive: true, force: true });\"",
     "lint": "tsc --noEmit"
   },
   "dependencies": {

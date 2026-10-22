@@ -28,5 +28,13 @@ thumbnails/
 *.flv
 *.wmv
 *.m4v
-*.ts
 *.m3u8
+*.omni
+
+# MPEG-TS video stream segments (allow TypeScript source code)
+public/live/**/*.ts
+processed/**/*.ts
+!server.ts
+!vite.config.ts
+!src/**/*.ts
+!lib/**/*.ts
