@@ -97,45 +97,47 @@ export function SearchBar() {
 
   return (
     <div ref={searchRef} className="relative w-full max-w-xl mx-auto hidden sm:block">
-      {/* Input Box Bar */}
+      {/* Input Box Bar (YouTube Unified Pill Style) */}
       <form
         onSubmit={(e) => { e.preventDefault(); handleSearch(query); }}
-        className="relative flex items-center"
+        className="relative flex items-center w-full"
       >
-        <div className="relative w-full">
-          <input
-            type="text"
-            value={query}
-            onChange={(e) => {
-              setQuery(e.target.value);
-              setIsOpen(true);
-              setSelectedIndex(-1);
-            }}
-            onFocus={() => setIsOpen(true)}
-            onKeyDown={handleKeyDown}
-            placeholder="Cari video di OmniHub..."
-            className="w-full bg-neutral-800/50 border border-white/10 focus:border-brand-500 text-white text-sm rounded-full py-2.5 pl-11 pr-10 focus:outline-none transition-colors shadow-inner"
-          />
-          <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-neutral-400" />
+        <div className="relative flex-1 flex items-center">
+          <div className="relative w-full">
+            <input
+              type="text"
+              value={query}
+              onChange={(e) => {
+                setQuery(e.target.value);
+                setIsOpen(true);
+                setSelectedIndex(-1);
+              }}
+              onFocus={() => setIsOpen(true)}
+              onKeyDown={handleKeyDown}
+              placeholder="Cari video di OmniHub..."
+              className="w-full bg-[#121214] border border-white/15 focus:border-brand-500 text-white text-sm rounded-l-full py-2 pl-10 pr-9 focus:outline-none transition-all shadow-inner placeholder:text-neutral-500"
+            />
+            <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-neutral-500" />
 
-          {query && (
-            <button
-              type="button"
-              onClick={() => { setQuery(''); setSuggestions([]); }}
-              className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-neutral-400 hover:text-white"
-            >
-              <X size={14} />
-            </button>
-          )}
+            {query && (
+              <button
+                type="button"
+                onClick={() => { setQuery(''); setSuggestions([]); }}
+                className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-neutral-400 hover:text-white"
+              >
+                <X size={14} />
+              </button>
+            )}
+          </div>
+
+          <button
+            type="submit"
+            className="bg-neutral-800/90 hover:bg-neutral-700 text-neutral-300 hover:text-white px-5 py-2.5 rounded-r-full transition-colors border border-l-0 border-white/15 flex items-center justify-center shrink-0"
+            title="Cari"
+          >
+            <Search size={16} />
+          </button>
         </div>
-
-        <button
-          type="submit"
-          className="ml-2 bg-neutral-800 hover:bg-neutral-700 text-white p-2.5 rounded-full transition-colors border border-white/10"
-          title="Cari"
-        >
-          <Search size={16} />
-        </button>
       </form>
 
       {/* Dropdown Suggestions / History Panel */}

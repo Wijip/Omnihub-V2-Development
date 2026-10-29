@@ -2,7 +2,7 @@
 import { Routes, Route, useLocation, Link, Navigate, useNavigate } from 'react-router-dom';
 import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Home, Video, Upload, Settings, Compass, List, History, ThumbsUp, Clock, BarChart2, Search, User, LogOut, Menu, X, CheckCircle2, Sparkles } from 'lucide-react';
+import { Home, Video, Upload, Settings, Compass, List, History, ThumbsUp, Clock, BarChart2, Search, User, LogOut, Menu, X, CheckCircle2, Sparkles, Plus, Radio } from 'lucide-react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import api from './lib/api';
@@ -32,12 +32,41 @@ import SystemLogsPage from './pages/SystemLogs';
 import AccountSettings from './pages/AccountSettings';
 
 import CreatorStudio from './pages/CreatorStudio';
+import HistoryPage from './pages/History';
+import ExplorePage from './pages/Explore';
+import LikedVideosPage from './pages/LikedVideos';
+import WatchLaterPage from './pages/WatchLater';
 import ErrorPage from './pages/ErrorPage';
 
 import { UploadProvider } from './contexts/UploadContext';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
+}
+
+function MiniRailItem({ to, icon, label }: { to: string, icon: React.ReactNode, label: string }) {
+  const location = useLocation();
+  const isActive = location.pathname === to;
+
+  return (
+    <Link
+      to={to}
+      title={label}
+      className={cn(
+        "flex flex-col items-center justify-center py-3.5 px-1 rounded-xl transition-all group w-full",
+        isActive
+          ? "bg-white/10 text-brand-400 font-bold"
+          : "text-neutral-400 hover:bg-white/5 hover:text-white"
+      )}
+    >
+      <div className={cn("transition-transform duration-200 group-hover:scale-110", isActive && "scale-110 text-brand-400")}>
+        {icon}
+      </div>
+      <span className={cn("text-[10px] mt-1.5 truncate max-w-[64px] text-center leading-tight tracking-tight", isActive ? "text-white font-bold" : "text-neutral-400")}>
+        {label}
+      </span>
+    </Link>
+  );
 }
 
 function SidebarItem({ to, icon, label, onClick }: { to: string, icon: React.ReactNode, label: string, onClick?: () => void }) {
@@ -49,58 +78,86 @@ function SidebarItem({ to, icon, label, onClick }: { to: string, icon: React.Rea
       to={to} 
       onClick={onClick}
       className={cn(
-        "flex items-center gap-4 py-3.5 px-4 rounded-xl transition-all font-bold text-sm group",
+        "flex items-center gap-4 py-2.5 px-3.5 rounded-xl transition-all font-bold text-sm group",
         isActive 
           ? "bg-brand-600 text-white shadow-md shadow-brand-500/20" 
-          : "text-neutral-400 hover:bg-white/5 hover:text-white"
+          : "text-neutral-300 hover:bg-white/5 hover:text-white"
       )}
     >
-      <div className={cn("transition-transform duration-300 group-hover:scale-110", isActive && "scale-110")}>
+      <div className={cn("transition-transform duration-200 group-hover:scale-110", isActive && "scale-105")}>
         {icon}
       </div>
-      <span>{label}</span>
+      <span className="truncate">{label}</span>
     </Link>
+  );
+}
+
+function SectionHeading({ title }: { title: string }) {
+  return (
+    <div className="px-3.5 pt-4 pb-1 text-[11px] font-black uppercase tracking-wider text-neutral-500">
+      {title}
+    </div>
   );
 }
 
 const NavLinks = ({ user, onItemClick }: { user: any; onItemClick?: () => void }) => (
   <>
-    <SidebarItem to="/" icon={<Home size={22} />} label="Home" onClick={onItemClick} />
-    <SidebarItem to="/explore" icon={<Compass size={22} />} label="Explore" onClick={onItemClick} />
+    <SidebarItem to="/" icon={<Home size={20} />} label="Beranda" onClick={onItemClick} />
+    <SidebarItem to="/explore" icon={<Compass size={20} />} label="Explore & Trending" onClick={onItemClick} />
     
     {user && (
       <>
-        <SidebarItem to="/playlists" icon={<List size={22} />} label="Playlists" onClick={onItemClick} />
-        <div className="h-px bg-white/10 my-3 mx-2" />
-        <SidebarItem to="/upload" icon={<Upload size={22} />} label="Upload Video" onClick={onItemClick} />
-        <SidebarItem to="/history" icon={<History size={22} />} label="History" onClick={onItemClick} />
-        <SidebarItem to="/liked" icon={<ThumbsUp size={22} />} label="Liked Videos" onClick={onItemClick} />
-        <SidebarItem to="/watch-later" icon={<Clock size={22} />} label="Watch Later" onClick={onItemClick} />
+        <div className="h-px bg-white/10 my-2 mx-2" />
+        <SectionHeading title="Koleksi Anda" />
+        <SidebarItem to="/playlists" icon={<List size={20} />} label="Playlists" onClick={onItemClick} />
+        <SidebarItem to="/history" icon={<History size={20} />} label="Riwayat Tontonan" onClick={onItemClick} />
+        <SidebarItem to="/liked" icon={<ThumbsUp size={20} />} label="Video yang Disukai" onClick={onItemClick} />
+        <SidebarItem to="/watch-later" icon={<Clock size={20} />} label="Tonton Nanti" onClick={onItemClick} />
+
+        <div className="h-px bg-white/10 my-2 mx-2" />
+        <SectionHeading title="Studio & Kreator" />
+        <SidebarItem to="/upload" icon={<Upload size={20} />} label="Upload Video" onClick={onItemClick} />
+        <SidebarItem to="/studio/live" icon={<Radio size={20} className="text-rose-500" />} label="Go Live" onClick={onItemClick} />
+        <SidebarItem to="/creator-studio" icon={<BarChart2 size={20} />} label="Creator Studio" onClick={onItemClick} />
+        <SidebarItem to="/studio" icon={<Video size={20} />} label="Video Manager" onClick={onItemClick} />
       </>
     )}
 
     {user?.role === 'admin' && (
       <>
-        <div className="h-px bg-white/10 my-3 mx-2" />
-        <SidebarItem to="/admin" icon={<BarChart2 size={22} />} label="Admin Dashboard" onClick={onItemClick} />
-        <SidebarItem to="/admin/logs" icon={<Settings size={22} />} label="System Health" onClick={onItemClick} />
+        <div className="h-px bg-white/10 my-2 mx-2" />
+        <SectionHeading title="Administrator" />
+        <SidebarItem to="/admin" icon={<BarChart2 size={20} />} label="Admin Dashboard" onClick={onItemClick} />
+        <SidebarItem to="/admin/logs" icon={<Settings size={20} />} label="System Health" onClick={onItemClick} />
       </>
     )}
   </>
 );
 
-function DesktopSidebar({ user }: { user: any }) {
+function DesktopSidebar({ user, isCollapsed }: { user: any; isCollapsed: boolean }) {
+  if (isCollapsed) {
+    return (
+      <aside className="w-[72px] h-full bg-[#0f0f0f] border-r border-white/10 flex flex-col items-center py-2 px-1 gap-1 overflow-y-auto no-scrollbar hidden md:flex shrink-0 z-40 transition-all duration-300">
+        <MiniRailItem to="/" icon={<Home size={22} />} label="Beranda" />
+        <MiniRailItem to="/explore" icon={<Compass size={22} />} label="Explore" />
+        {user && (
+          <>
+            <MiniRailItem to="/playlists" icon={<List size={22} />} label="Playlists" />
+            <MiniRailItem to="/history" icon={<History size={22} />} label="History" />
+            <MiniRailItem to="/liked" icon={<ThumbsUp size={22} />} label="Disukai" />
+            <MiniRailItem to="/watch-later" icon={<Clock size={22} />} label="Nanti" />
+          </>
+        )}
+        {user?.role === 'admin' && (
+          <MiniRailItem to="/admin" icon={<BarChart2 size={22} />} label="Admin" />
+        )}
+      </aside>
+    );
+  }
+
   return (
-    <aside className="w-64 h-full glass border-r border-white/10 flex flex-col transition-all duration-300 overflow-y-auto no-scrollbar hidden md:flex shrink-0">
-      <div className="p-6 border-b border-white/10 shrink-0">
-        <Link to="/" className="flex items-center gap-3 text-brand-500 font-black text-2xl tracking-tighter">
-          <div className="w-8 h-8 bg-brand-600 rounded-lg flex items-center justify-center text-white shadow-lg shadow-brand-500/20">
-            <Video fill="currentColor" size={18} />
-          </div>
-          <span className="text-white font-display">OmniHub</span>
-        </Link>
-      </div>
-      <nav className="flex-1 p-4 flex flex-col gap-1.5">
+    <aside className="w-60 h-full bg-[#0f0f0f] border-r border-white/10 flex flex-col overflow-y-auto no-scrollbar hidden md:flex shrink-0 z-40 transition-all duration-300">
+      <nav className="flex-1 p-3 flex flex-col gap-1">
         <NavLinks user={user} />
       </nav>
     </aside>
@@ -180,6 +237,25 @@ export default function App() {
   const [isNavigating, setIsNavigating] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem('omnihub_sidebar_collapsed') === 'true';
+    } catch {
+      return false;
+    }
+  });
+
+  const toggleSidebar = () => {
+    if (typeof window !== 'undefined' && window.innerWidth < 768) {
+      setIsMobileMenuOpen((prev) => !prev);
+    } else {
+      setIsSidebarCollapsed((prev) => {
+        const next = !prev;
+        try { localStorage.setItem('omnihub_sidebar_collapsed', String(next)); } catch {}
+        return next;
+      });
+    }
+  };
   
   // Lifted Search State (Tahap 39.1)
   const [searchQuery, setSearchQuery] = useState('');
@@ -291,7 +367,7 @@ export default function App() {
   return (
     <ThemeProvider>
       <UploadProvider>
-        <div className="flex h-screen w-full overflow-hidden overflow-x-hidden bg-neutral-900 text-white font-sans">
+        <div className="flex flex-col h-screen w-full overflow-hidden bg-[#0f0f0f] text-white font-sans">
         
         <AnimatePresence>
           {isNavigating && (
@@ -305,75 +381,104 @@ export default function App() {
           )}
         </AnimatePresence>
 
-        <AnimatePresence>
-          {isMobileMenuOpen && (
-            <>
-              <motion.div
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                onClick={() => setIsMobileMenuOpen(false)}
-                className="fixed inset-0 bg-black/70 backdrop-blur-sm z-[110] md:hidden"
-              />
-              <motion.aside
-                initial={{ x: '-100%' }}
-                animate={{ x: 0 }}
-                exit={{ x: '-100%' }}
-                transition={{ type: 'spring', damping: 25, stiffness: 200 }}
-                className="fixed top-0 left-0 bottom-0 w-[280px] bg-neutral-900 border-r border-white/10 z-[120] flex flex-col md:hidden overflow-hidden"
+        {/* TOP FULL-WIDTH YOUTUBE HEADER */}
+        <header className="h-14 bg-[#0f0f0f]/95 backdrop-blur-md border-b border-white/10 flex items-center justify-between px-3 md:px-5 shrink-0 sticky top-0 z-50">
+          {/* LEFT: HAMBURGER & LOGO */}
+          <div className="flex items-center gap-3 shrink-0">
+            <button 
+              onClick={toggleSidebar}
+              title="Menu Navigasi"
+              className="p-2 rounded-full text-neutral-300 hover:text-white hover:bg-white/10 transition-colors active:scale-95"
+            >
+              <Menu size={22} />
+            </button>
+
+            <Link to="/" className="flex items-center gap-2.5 text-white font-black text-xl tracking-tighter group">
+              <div className="w-8 h-8 bg-brand-600 rounded-lg flex items-center justify-center text-white shadow-md shadow-brand-500/30 group-hover:scale-105 transition-transform">
+                <Video fill="currentColor" size={17} />
+              </div>
+              <span className="font-display font-black text-lg tracking-tight hidden xs:inline">OmniHub</span>
+            </Link>
+          </div>
+
+          {/* CENTER: YOUTUBE SEARCH PILL */}
+          <div className="flex-1 max-w-2xl mx-4 hidden sm:block">
+            <SearchBar />
+          </div>
+
+          {/* RIGHT: CREATE + THEME + USER */}
+          <div className="flex items-center gap-2 sm:gap-3 shrink-0">
+            {user && (
+              <Link 
+                to="/upload" 
+                title="Upload Video"
+                className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-full bg-white/5 hover:bg-white/10 border border-white/10 text-white font-bold text-xs transition-all active:scale-95 shadow-sm"
               >
-                <div className="p-5 flex items-center justify-between border-b border-white/10 shrink-0">
-                  <Link to="/" onClick={() => setIsMobileMenuOpen(false)} className="flex items-center gap-3 text-brand-500 font-black text-xl tracking-tighter">
-                    <div className="w-8 h-8 bg-brand-600 rounded-lg flex items-center justify-center text-white shadow-lg shadow-brand-500/20">
-                      <Video fill="currentColor" size={16} />
-                    </div>
-                    <span className="text-white font-display">OmniHub</span>
-                  </Link>
-                  <button onClick={() => setIsMobileMenuOpen(false)} className="p-2 -mr-2 bg-white/5 rounded-full text-neutral-400 hover:text-white transition-colors active:scale-95">
-                    <X size={20} />
-                  </button>
-                </div>
-                <nav className="flex-1 overflow-y-auto p-4 flex flex-col gap-1.5 no-scrollbar pb-safe">
-                  <NavLinks user={user} onItemClick={() => setIsMobileMenuOpen(false)} />
-                </nav>
-              </motion.aside>
-            </>
-          )}
-        </AnimatePresence>
+                <Plus size={16} className="text-brand-400" />
+                <span className="hidden md:inline">Buat</span>
+              </Link>
+            )}
 
-        <DesktopSidebar user={user} />
+            <ThemeToggle />
 
-        <div className="flex-1 flex flex-col h-full relative bg-[#050505] overflow-hidden overflow-x-hidden">
-          
-          <header className="h-[72px] glass border-b border-white/10 flex items-center justify-between px-4 md:px-6 shrink-0 sticky top-0 z-50">
-            <div className="flex items-center gap-4 flex-1">
-              <button 
-                onClick={() => setIsMobileMenuOpen(true)}
-                className="p-2 -ml-2 rounded-xl text-neutral-400 hover:text-white hover:bg-white/5 md:hidden transition-colors active:scale-95"
-              >
-                <Menu size={26} />
-              </button>
+            {user === null ? (
+              <Link to="/auth" className="flex items-center gap-2 border border-brand-500/50 hover:bg-brand-500/10 text-brand-400 px-4 py-1.5 rounded-full font-bold transition-all active:scale-95 text-xs shadow-sm">
+                <User size={15} />
+                <span>Sign In</span>
+              </Link>
+            ) : (
+              <div className="flex items-center">
+                <ProfileMenu />
+              </div>
+            )}
+          </div>
+        </header>
 
-              <SearchBar />
-            </div>
+        {/* BODY SHELL: SIDEBAR + CONTENT */}
+        <div className="flex-1 flex overflow-hidden relative">
+          {/* MOBILE DRAWER */}
+          <AnimatePresence>
+            {isMobileMenuOpen && (
+              <>
+                <motion.div
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  onClick={() => setIsMobileMenuOpen(false)}
+                  className="fixed inset-0 bg-black/70 backdrop-blur-sm z-[110] md:hidden"
+                />
+                <motion.aside
+                  initial={{ x: '-100%' }}
+                  animate={{ x: 0 }}
+                  exit={{ x: '-100%' }}
+                  transition={{ type: 'spring', damping: 25, stiffness: 200 }}
+                  className="fixed top-0 left-0 bottom-0 w-[260px] bg-[#0f0f0f] border-r border-white/10 z-[120] flex flex-col md:hidden overflow-hidden"
+                >
+                  <div className="h-14 px-4 flex items-center justify-between border-b border-white/10 shrink-0">
+                    <Link to="/" onClick={() => setIsMobileMenuOpen(false)} className="flex items-center gap-2.5 text-white font-black text-xl tracking-tighter">
+                      <div className="w-8 h-8 bg-brand-600 rounded-lg flex items-center justify-center text-white shadow-md shadow-brand-500/20">
+                        <Video fill="currentColor" size={16} />
+                      </div>
+                      <span className="text-white font-display text-lg">OmniHub</span>
+                    </Link>
+                    <button onClick={() => setIsMobileMenuOpen(false)} className="p-1.5 rounded-full text-neutral-400 hover:text-white hover:bg-white/10 transition-colors">
+                      <X size={20} />
+                    </button>
+                  </div>
+                  <nav className="flex-1 overflow-y-auto p-3 flex flex-col gap-1 no-scrollbar pb-safe">
+                    <NavLinks user={user} onItemClick={() => setIsMobileMenuOpen(false)} />
+                  </nav>
+                </motion.aside>
+              </>
+            )}
+          </AnimatePresence>
 
-            <div className="flex items-center gap-3 shrink-0">
-              <ThemeToggle />
-              {user === null ? (
-                <Link to="/auth" className="flex items-center gap-2 bg-brand-600 hover:bg-brand-700 text-white px-5 py-2.5 rounded-xl font-bold transition-all shadow-lg shadow-brand-500/20 active:scale-95 text-sm">
-                  <User size={18} />
-                  Sign In
-                </Link>
-              ) : (
-                <div className="flex items-center gap-4">
-                  <ProfileMenu />
-                </div>
-              )}
-            </div>
-          </header>
+          {/* DESKTOP SIDEBAR (EXPANDED OR MINI-RAIL) */}
+          <DesktopSidebar user={user} isCollapsed={isSidebarCollapsed} />
 
-          <main className="flex-1 overflow-y-auto overflow-x-hidden p-4 md:p-8 pb-[calc(100px+env(safe-area-inset-bottom))] md:pb-8 relative">
-            <div className="max-w-[1800px] mx-auto w-full">
+          {/* MAIN PAGE CONTENT */}
+          <main className="flex-1 overflow-y-auto overflow-x-hidden p-4 md:p-6 pb-[calc(100px+env(safe-area-inset-bottom))] md:pb-8 relative bg-[#09090b]">
+            <div className="max-w-[1920px] mx-auto w-full">
               <AnimatePresence mode="wait">
                 <motion.div
                   key={location.pathname}
@@ -388,6 +493,7 @@ export default function App() {
                       {/* Public Routes */}
                       <Route path="/" element={<HomePage searchQuery={new URLSearchParams(location.search).get('q') || ''} isSearching={isSearching} setIsSearching={setIsSearching} />} />
                       <Route path="/search" element={<HomePage searchQuery={new URLSearchParams(location.search).get('q') || ''} isSearching={isSearching} setIsSearching={setIsSearching} />} />
+                      <Route path="/explore" element={<ExplorePage />} />
                       <Route path="/home" element={<Navigate to="/" replace />} />
                       <Route path="/video/:id" element={<VideoDetailPage />} />
                       <Route path="/auth" element={<AuthPage setUser={setUser} />} />
@@ -395,6 +501,7 @@ export default function App() {
                       <Route path="/playlist/:id" element={<PlaylistDetailPage />} />
                       <Route path="/analytics/:id" element={<AnalyticsPage />} />
                       <Route path="/channel" element={<Channel />} />
+                      <Route path="/channel/:id" element={<Channel />} />
 
                       {/* Protected Routes (RBAC) */}
                       <Route path="/upload" element={user ? <UploadPage /> : <Navigate to="/auth" replace />} />
@@ -402,6 +509,9 @@ export default function App() {
                       <Route path="/studio/live" element={user ? <LiveStudio /> : <Navigate to="/auth" replace />} />
                       <Route path="/creator-studio" element={user ? <CreatorStudio /> : <Navigate to="/auth" replace />} />
                       <Route path="/playlists" element={user ? <PlaylistsPage /> : <Navigate to="/auth" replace />} />
+                      <Route path="/history" element={user ? <HistoryPage /> : <Navigate to="/auth" replace />} />
+                      <Route path="/liked" element={user ? <LikedVideosPage /> : <Navigate to="/auth" replace />} />
+                      <Route path="/watch-later" element={user ? <WatchLaterPage /> : <Navigate to="/auth" replace />} />
                       <Route path="/settings" element={user ? <AccountSettings /> : <Navigate to="/auth" replace />} />
                       
                       {/* Admin Only Routes (RBAC) */}

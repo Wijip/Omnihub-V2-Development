@@ -3,7 +3,7 @@ import { useParams, Link, useNavigate } from 'react-router-dom';
 import api from '../lib/api';
 import { Play, List, Eye, Loader2, User, Clock, ChevronLeft, MoreVertical, Share2, Trash2, Edit3, AlertCircle, PlayCircle } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { cn } from '../lib/utils';
+import { cn, formatDuration } from '../lib/utils';
 
 export default function PlaylistDetailPage() {
   const { id } = useParams();
@@ -179,7 +179,7 @@ export default function PlaylistDetailPage() {
                         </div>
                       )}
                       <div className="absolute bottom-3 right-3 bg-black/80 backdrop-blur-xl text-white text-[10px] px-3 py-1.5 rounded-xl font-black uppercase tracking-widest shadow-2xl border border-white/10">
-                        10:00
+                        {formatDuration(video.duration)}
                       </div>
                       <div className="absolute inset-0 bg-brand-600/10 opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
                     </div>
@@ -190,7 +190,7 @@ export default function PlaylistDetailPage() {
                           {video.title}
                         </h3>
                         <div className="flex flex-wrap items-center gap-4 text-[10px] text-neutral-400 font-black uppercase tracking-widest">
-                          <span className="text-neutral-900 dark:text-white font-bold">{video.first_name} {video.last_name}</span>
+                          <span className="text-neutral-900 dark:text-white font-bold">{video.firstName || video.first_name || 'Creator'} {video.lastName || video.last_name || ''}</span>
                           <span className="w-1 h-1 bg-neutral-200 dark:bg-neutral-800 rounded-full" />
                           <span className="flex items-center gap-1.5"><Eye size={14} /> {video.views.toLocaleString()} views</span>
                           <span className="w-1 h-1 bg-neutral-200 dark:bg-neutral-800 rounded-full" />

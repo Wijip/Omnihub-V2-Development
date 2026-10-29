@@ -61,6 +61,10 @@ export const initDB = async () => {
           query: `CREATE TABLE IF NOT EXISTS WatchHistory (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT, video_id INT, watched_at DATETIME DEFAULT CURRENT_TIMESTAMP, watch_time INT DEFAULT 0, FOREIGN KEY(user_id) REFERENCES Users(id) ON DELETE CASCADE, FOREIGN KEY(video_id) REFERENCES Videos(id) ON DELETE CASCADE)`
         },
         {
+          name: 'WatchLater',
+          query: `CREATE TABLE IF NOT EXISTS WatchLater (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT NOT NULL, video_id INT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY unique_watch_later (user_id, video_id), FOREIGN KEY(user_id) REFERENCES Users(id) ON DELETE CASCADE, FOREIGN KEY(video_id) REFERENCES Videos(id) ON DELETE CASCADE)`
+        },
+        {
           name: 'admin_deletion_logs',
           query: `CREATE TABLE IF NOT EXISTS admin_deletion_logs (id INT AUTO_INCREMENT PRIMARY KEY, video_id INT, title VARCHAR(255), creator_name VARCHAR(255), archive_path VARCHAR(255), deleted_at DATETIME, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`
         }

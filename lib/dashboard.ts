@@ -1,10 +1,10 @@
 import blessed from 'blessed';
 // @ts-ignore (Karena modul contrib terkadang tidak memiliki deklarasi tipe yang lengkap)
 import contrib from 'blessed-contrib';
-import os from 'os';
-import path from 'path';
-import fs from 'fs';
-import { exec, spawn } from 'child_process';
+import os from 'node:os';
+import path from 'node:path';
+import fs from 'node:fs';
+import { exec, spawn } from 'node:child_process';
 
 export const screen = blessed.screen({ smartCSR: true, title: 'OmniHub Server Control Center' });
 const grid = new contrib.grid({ rows: 12, cols: 12, screen: screen });

@@ -1,14 +1,30 @@
-import { spawn } from "child_process";
+import { spawn, execSync } from "node:child_process";
 import express from 'express';
 import { GoogleGenAI } from '@google/genai';
+import dotenv from 'dotenv';
 
-const aiApiKey = process.env.GEMINI_API_KEY || '';
-const aiInstance = new GoogleGenAI({ apiKey: aiApiKey });
-import http from 'http';
+dotenv.config({ override: true });
+dotenv.config({ path: '.env.local', override: true });
+
+const getAiApiKey = () => process.env.GEMINI_API_KEY || '';
+let cachedAiInstance: GoogleGenAI | null = null;
+let lastApiKey: string = '';
+const getAiInstance = () => {
+  const key = getAiApiKey().trim();
+  if (!key) return null;
+  if (!cachedAiInstance || lastApiKey !== key) {
+    cachedAiInstance = new GoogleGenAI({ apiKey: key });
+    lastApiKey = key;
+  }
+  return cachedAiInstance;
+};
+const aiApiKey = getAiApiKey();
+const aiInstance = getAiInstance();
+import http from 'node:http';
 import { Server } from 'socket.io';
-import path from 'path';
-import fs from 'fs';
-import { fileURLToPath } from 'url';
+import path from 'node:path';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 // --- DEKLARASI Wajib ESM __DIRNAME (TAHAP 44.3) ---
 const __filename = fileURLToPath(import.meta.url);
@@ -56,7 +72,7 @@ import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { createServer as createViteServer } from 'vite';
 import db, { initDB } from './src/lib/db';
-import { Readable, Transform } from 'stream';
+import { Readable, Transform } from 'node:stream';
 
 process.on('uncaughtException', (err) => { console.error('CRASH PREVENTED:', err); });
 process.on('unhandledRejection', (reason) => { console.error('PROMISE REJECTION PREVENTED:', reason); });
@@ -585,6 +601,21 @@ const authenticate = (req: any, res: any, next: any) => {
   }
 };
 
+const optionalAuthenticate = (req: any, res: any, next: any) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (token && token !== 'undefined' && token !== 'null') {
+    try {
+      const decoded: any = jwt.verify(token, JWT_SECRET);
+      if (!disabledUsers.includes(decoded.id)) {
+        req.user = decoded;
+      }
+    } catch (e) {
+      // Token tidak valid atau kedaluwarsa, lanjut sebagai guest tanpa req.user
+    }
+  }
+  next();
+};
+
 const isAdmin = (req: any, res: any, next: any) => {
   if (req.user?.role !== 'admin') {
     return res.status(403).json({ error: 'Forbidden: Admin access required' });
@@ -704,6 +735,207 @@ async function calculateNextMeeting(studentName: string, programId: number, sess
 }
 
 // ============================================================================
+// GEMINI MULTIMODAL AUTO-REPORT GENERATOR (ASYNC BACKGROUND PIPELINE)
+// ============================================================================
+async function generateGeminiAutoReportAsync(videoId: number, candidateVideoPath: string, isTempFile: boolean = false) {
+  try {
+    const ai = getAiInstance();
+    if (!ai) {
+      console.warn(`[GEMINI] GEMINI_API_KEY tidak ditemukan di environment. Melewati pembuatan laporan otomatis untuk VideoID: ${videoId}`);
+      return;
+    }
+
+    const [videoMetaRows]: any = await db.query(
+      'SELECT title, description, student_name, program_id, meeting_number, session_date FROM Videos WHERE id = ?',
+      [videoId]
+    );
+
+    if (!videoMetaRows || videoMetaRows.length === 0) return;
+    const meta = videoMetaRows[0];
+    const studentName = meta.student_name || meta.title || 'Siswa';
+    const programId = meta.program_id;
+    const sessionDateStr = meta.session_date
+      ? new Date(meta.session_date).toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' })
+      : new Date().toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' });
+
+    if (!programId) {
+      console.log(`[GEMINI] VideoID: ${videoId} tidak memiliki program_id. Melewati auto-report.`);
+      return;
+    }
+
+    if (!candidateVideoPath || !fs.existsSync(candidateVideoPath)) {
+      console.warn(`[GEMINI] Berkas video tidak ditemukan di ${candidateVideoPath}, melewati AI report.`);
+      return;
+    }
+
+    console.log(`[GEMINI] Memulai analisis multimodal background untuk VideoID: ${videoId} (File: ${candidateVideoPath})...`);
+
+    // 1. Ambil Nama Program
+    const [progRows]: any = await db.query('SELECT program_name FROM Programs WHERE id = ?', [programId]);
+    const programName = progRows.length > 0 ? progRows[0].program_name : 'Koding Akademi';
+
+    // 2. Hitung/Validasi Nomor Pertemuan Otomatis
+    const meetingCalc = await calculateNextMeeting(studentName, programId, meta.session_date);
+    const validMeetingNumber = meta.meeting_number || meetingCalc.recommendedMeeting;
+
+    const promptText = `Kamu adalah Asisten Pengajar & Pembuat Laporan Pembelajaran Otomatis untuk Koding Akademi di OmniHub.
+Tugasmu adalah menganalisis berkas video pembelajaran yang diberikan dan mengekstrak materi serta ringkasan pembelajaran hari ini.
+
+Keluaran WAJIB berupa blok kode (markdown code block) dengan format persis seperti ini:
+
+\`\`\`text
+*WEEKLY REPORT*
+
+Tanggal: ${sessionDateStr}
+Nama: ${studentName}
+Pertemuan : ${validMeetingNumber}
+Program : ${programName}
+Materi: [Tuliskan ringkasan singkat materi teknis yang dipelajari di video]
+Pembelajaran hari ini : [Tuliskan 2-4 kalimat detail aktivitas siswa, perangkat/kode yang dibuat, serta kendala/troubleshooting yang berhasil diselesaikan]
+
+Note :Good Job ${studentName}, [Tuliskan kata-kata penyemangat yang relevan dengan pembelajaran siswa]
+\`\`\`
+
+Aturan Penulisan:
+1. "Materi" berupa ringkasan topik teknis yang dibahas dalam video.
+2. "Pembelajaran hari ini" menceritakan aktivitas siswa dalam video secara profesional dan ramah.
+3. "Note" wajib diawali dengan "Good Job ${studentName}," diikuti kata penyemangat.
+4. TAMPILKAN HANYA BLOK KODE KELUARAN TANPA TEKS PENGANTAR LAIN.`;
+
+    const modelName = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
+    const fileSize = fs.statSync(candidateVideoPath).size;
+    let aiResponse: any = null;
+
+    // Jika file < 20MB, gunakan inlineData (sangat cepat untuk video kompresi 360p)
+    if (fileSize < 20 * 1024 * 1024) {
+      console.log(`[GEMINI] Menggunakan inlineData (${Math.round(fileSize / 1024)} KB) untuk VideoID: ${videoId}`);
+      const videoBuffer = fs.readFileSync(candidateVideoPath);
+      const videoBase64 = videoBuffer.toString('base64');
+
+      try {
+        aiResponse = await ai.models.generateContent({
+          model: modelName,
+          contents: [
+            {
+              inlineData: {
+                mimeType: 'video/mp4',
+                data: videoBase64
+              }
+            },
+            { text: promptText }
+          ]
+        });
+      } catch (err: any) {
+        // Fallback jika model gagal (misal gemini-3.5-flash -> gemini-3.5-flash-lite)
+        if (modelName !== 'gemini-3.5-flash-lite') {
+          console.warn(`[GEMINI] Percobaan model ${modelName} gagal (${err.message}). Mencoba model fallback gemini-3.5-flash-lite...`);
+          aiResponse = await ai.models.generateContent({
+            model: 'gemini-3.5-flash-lite',
+            contents: [
+              {
+                inlineData: {
+                  mimeType: 'video/mp4',
+                  data: videoBase64
+                }
+              },
+              { text: promptText }
+            ]
+          });
+        } else {
+          throw err;
+        }
+      }
+    } else {
+      // Jika file >= 20MB, gunakan Gemini Files API
+      console.log(`[GEMINI] Ukuran video ${Math.round(fileSize / (1024 * 1024))} MB (>= 20MB). Mengunggah via Gemini File API...`);
+      const uploadedFile = await ai.files.upload({
+        file: candidateVideoPath,
+        config: {
+          mimeType: 'video/mp4'
+        }
+      });
+
+      try {
+        let fileState = uploadedFile;
+        let attempts = 0;
+        while (fileState.state === 'PROCESSING' && attempts < 30) {
+          await new Promise(r => setTimeout(r, 2000));
+          fileState = await ai.files.get({ name: uploadedFile.name });
+          attempts++;
+        }
+
+        if (fileState.state === 'FAILED') {
+          throw new Error('Proses video di Gemini File API gagal (status FAILED)');
+        }
+
+        try {
+          aiResponse = await ai.models.generateContent({
+            model: modelName,
+            contents: [
+              fileState,
+              { text: promptText }
+            ]
+          });
+        } catch (err: any) {
+          if (modelName !== 'gemini-3.5-flash-lite') {
+            console.warn(`[GEMINI] Model ${modelName} gagal (${err.message}). Mencoba fallback gemini-3.5-flash-lite...`);
+            aiResponse = await ai.models.generateContent({
+              model: 'gemini-3.5-flash-lite',
+              contents: [
+                fileState,
+                { text: promptText }
+              ]
+            });
+          } else {
+            throw err;
+          }
+        }
+      } finally {
+        try {
+          if (uploadedFile && uploadedFile.name) {
+            await ai.files.delete({ name: uploadedFile.name });
+            console.log(`[GEMINI] Berkas di Gemini File API (${uploadedFile.name}) berhasil dibersihkan.`);
+          }
+        } catch (delErr) {
+          /* ignore deletion error */
+        }
+      }
+    }
+
+    const generatedReport = aiResponse && aiResponse.text ? aiResponse.text.trim() : '';
+
+    if (generatedReport) {
+      // Update Deskripsi Video dengan Laporan Gemini
+      await db.execute('UPDATE Videos SET description = ? WHERE id = ?', [generatedReport, videoId]);
+
+      // Update/Upsert StudentProgress
+      const sqlUpsert = `
+        INSERT INTO StudentProgress (student_name, program_id, last_meeting_number, last_session_date)
+        VALUES (?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE 
+          last_meeting_number = VALUES(last_meeting_number),
+          last_session_date = VALUES(last_session_date)
+      `;
+      const dbDate = meta.session_date ? new Date(meta.session_date).toISOString().split('T')[0] : new Date().toISOString().split('T')[0];
+      await db.execute(sqlUpsert, [studentName.trim(), programId, validMeetingNumber, dbDate]);
+      console.log(`[GEMINI SUCCESS] Weekly Report berhasil digenerate dan dikaitkan ke VideoID: ${videoId}`);
+
+      // Emit event agar UI VideoDetail yang sedang terbuka langsung memperbarui deskripsi!
+      io.emit('video-progress-' + videoId, { status: 'ready', description: generatedReport });
+    }
+  } catch (geminiErr: any) {
+    console.error(`[GEMINI ERROR] Gagal membuat laporan otomatis untuk VideoID ${videoId}:`, geminiErr.message || geminiErr);
+  } finally {
+    if (isTempFile && candidateVideoPath && fs.existsSync(candidateVideoPath)) {
+      try {
+        fs.unlinkSync(candidateVideoPath);
+        console.log(`[GEMINI] File temporary ${candidateVideoPath} berhasil dibersihkan.`);
+      } catch (e) { /* ignore */ }
+    }
+  }
+}
+
+// ============================================================================
 // 5. MULTI-RESOLUTION FFMPEG GPU CUDA (RTX 3050 HARDWARE PIPELINE)
 // ============================================================================
 function processVideo(videoId: number, inputPath: string, originalFilename: string, uploadId?: string): Promise<void> {
@@ -720,6 +952,19 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
         obfuscateFileInPlace(inputPath);
       } else {
         throw new Error('Input obfuscated file not found');
+      }
+
+      // Probe exact video duration using ffprobe
+      let detectedVideoDuration = 0;
+      try {
+        const probeOut = execSync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${inputPath}"`).toString().trim();
+        const parsedDur = parseFloat(probeOut);
+        if (!isNaN(parsedDur) && parsedDur > 0) {
+          detectedVideoDuration = Math.round(parsedDur);
+          console.log(`[FFPROBE] Detected Video Duration for VideoID ${videoId}: ${detectedVideoDuration}s`);
+        }
+      } catch (probeErr) {
+        console.warn(`[FFPROBE] Could not detect video duration for VideoID ${videoId}:`, probeErr);
       }
 
       let highestResUrl = '';
@@ -1020,119 +1265,64 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
         throw new Error(`Hybrid Phase Transcoding failed: ${error.message}`);
       }
 
-      // --- TAHAP 63.0: GEMINI 3.6 FLASH AUTO-REPORT GENERATOR PIPELINE ---
+      // Persiapkan salinan video resolusi rendah untuk AI Multimodal (prioritas 360p/480p)
+      let aiVideoCandidatePath = '';
+      let isAiVideoTemp = false;
+
       try {
-        const [videoMetaRows]: any = await db.query('SELECT title, description, student_name, program_id, meeting_number, session_date FROM Videos WHERE id = ?', [videoId]);
-        if (videoMetaRows && videoMetaRows.length > 0) {
-          const meta = videoMetaRows[0];
-          const studentName = meta.student_name || meta.title || 'Siswa';
-          const programId = meta.program_id;
-          const sessionDateStr = meta.session_date ? new Date(meta.session_date).toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' }) : new Date().toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' });
-
-          if (programId) {
-            console.log(`[GEMINI 63.0] Memulai analisis video dengan model gemini-3.6-flash untuk VideoID: ${videoId}...`);
-            
-            // 1. Ambil Nama Program
-            const [progRows]: any = await db.query('SELECT program_name FROM Programs WHERE id = ?', [programId]);
-            const programName = progRows.length > 0 ? progRows[0].program_name : 'Koding Akademi';
-
-            // 2. Hitung/Validasi Nomor Pertemuan Otomatis
-            const meetingCalc = await calculateNextMeeting(studentName, programId, meta.session_date);
-            const validMeetingNumber = meta.meeting_number || meetingCalc.recommendedMeeting;
-
-            // 3. Baca Berkas Video untuk Gemini Multimodal
-            const inputVideoForAi = fs.existsSync(activeInputPath) ? activeInputPath : '';
-            if (!inputVideoForAi) {
-              console.warn(`[GEMINI 63.0] Video file not found at ${activeInputPath}, skipping AI report`);
-              return;
-            }
-            const videoBuffer = fs.readFileSync(inputVideoForAi);
-            const videoBase64 = videoBuffer.toString('base64');
-
-            const promptText = `Kamu adalah Asisten Pengajar & Pembuat Laporan Pembelajaran Otomatis untuk Koding Akademi di OmniHub.
-Tugasmu adalah menganalisis berkas video pembelajaran yang diberikan dan mengekstrak materi serta ringkasan pembelajaran hari ini.
-
-Keluaran WAJIB berupa blok kode (markdown code block) dengan format persis seperti ini:
-
-\`\`\`text
-*WEEKLY REPORT*
-
-Tanggal: ${sessionDateStr}
-Nama: ${studentName}
-Pertemuan : ${validMeetingNumber}
-Program : ${programName}
-Materi: [Tuliskan ringkasan singkat materi teknis yang dipelajari di video]
-Pembelajaran hari ini : [Tuliskan 2-4 kalimat detail aktivitas siswa, perangkat/kode yang dibuat, serta kendala/troubleshooting yang berhasil diselesaikan]
-
-Note :Good Job ${studentName}, [Tuliskan kata-kata penyemangat yang relevan dengan pembelajaran siswa]
-\`\`\`
-
-Aturan Penulisan:
-1. "Materi" berupa ringkasan topik teknis yang dibahas dalam video.
-2. "Pembelajaran hari ini" menceritakan aktivitas siswa dalam video secara profesional dan ramah.
-3. "Note" wajib diawali dengan "Good Job ${studentName}," diikuti kata penyemangat.
-4. TAMPILKAN HANYA BLOK KODE KELUARAN TANPA TEKS PENGANTAR LAIN.`;
-
-            const aiResponse = await aiInstance.models.generateContent({
-              model: 'gemini-3.6-flash',
-              contents: [
-                {
-                  inlineData: {
-                    mimeType: 'video/mp4',
-                    data: videoBase64
-                  }
-                },
-                { text: promptText }
-              ]
-            });
-
-            const generatedReport = aiResponse.text ? aiResponse.text.trim() : '';
-
-            if (generatedReport) {
-              // Update Deskripsi Video dengan Laporan Gemini
-              await db.execute('UPDATE Videos SET description = ? WHERE id = ?', [generatedReport, videoId]);
-
-              // Update/Upsert StudentProgress
-              const sqlUpsert = `
-                INSERT INTO StudentProgress (student_name, program_id, last_meeting_number, last_session_date)
-                VALUES (?, ?, ?, ?)
-                ON DUPLICATE KEY UPDATE 
-                  last_meeting_number = VALUES(last_meeting_number),
-                  last_session_date = VALUES(last_session_date)
-              `;
-              const dbDate = meta.session_date ? new Date(meta.session_date).toISOString().split('T')[0] : new Date().toISOString().split('T')[0];
-              await db.execute(sqlUpsert, [studentName.trim(), programId, validMeetingNumber, dbDate]);
-              console.log(`[GEMINI 63.0] Weekly Report berhasil digenerate dan dikaitkan ke VideoID: ${videoId}`);
-            }
+        const sortedRes = [...activeResolutions].sort((a: any, b: any) => a[1].height - b[1].height);
+        if (sortedRes.length > 0) {
+          const lowestResKey = sortedRes[0][0];
+          const omniLowResPath = path.join(PROCESSED_DIR, `processed-${videoId}-${lowestResKey}.mp4.omni`);
+          if (fs.existsSync(omniLowResPath)) {
+            const tempAiPath = path.join(PROCESSED_DIR, `temp-ai-${videoId}.mp4`);
+            fs.copyFileSync(omniLowResPath, tempAiPath);
+            obfuscateFileInPlace(tempAiPath); // Pulihkan header MP4 standar dari .omni
+            aiVideoCandidatePath = tempAiPath;
+            isAiVideoTemp = true;
           }
         }
-      } catch (geminiErr: any) {
-        console.error(`[GEMINI ERROR 63.0] Gagal membuat laporan otomatis untuk VideoID ${videoId}:`, geminiErr.message || geminiErr);
+      } catch (prepErr) {
+        console.warn(`[GEMINI PREP] Gagal menyiapkan salinan resolusi rendah untuk AI:`, prepErr);
       }
 
-      // STAGE 77.8: Finalize master video record ONLY after ALL resolutions & Gemini tasks finish
-      await db.execute('UPDATE Videos SET status = ?, url = ? WHERE id = ? OR upload_id = ?', ['ready', highestResUrl, videoId, uploadId || '']);
-      if (uploadId) {
-          encodingProgressMap.set(uploadId, 100);
-      }
-      await systemLog('INFO', 'FFmpeg', `Successfully completed multi-resolution processing for video ${videoId}`, { encodingTime: Math.round((Date.now() - startTime) / 1000) });
-      console.log(`[SYSTEM] FFmpeg Transcoding PIPELINE SUCCESS for VideoID: ${videoId}`);
-      
-      // Cleanup source file to drop storage use (Stage 1.6)
+      // Hapus file sumber mentah (uploads/) untuk menghemat ruang disk (Stage 1.6)
       if (fs.existsSync(activeInputPath)) {
         try { fs.unlinkSync(activeInputPath); } catch (e) { /* ignore */ }
       }
 
-      // MANDATORY: Emit completion signal to UI ONLY AFTER everything is finished
-      io.emit('video-progress-' + videoId, { status: 'ready', progress: 100 });
+      // STAGE 77.8: Finalisasi record master video SEGERA setelah transcoding FFmpeg selesai
+      await db.execute('UPDATE Videos SET status = ?, url = ?, duration = COALESCE(NULLIF(?, 0), duration, 0) WHERE id = ? OR upload_id = ?', ['ready', highestResUrl, detectedVideoDuration, videoId, uploadId || '']);
+      if (uploadId) {
+        encodingProgressMap.set(uploadId, 100);
+      }
+      await systemLog('INFO', 'FFmpeg', `Successfully completed multi-resolution processing for video ${videoId}`, { encodingTime: Math.round((Date.now() - startTime) / 1000) });
+      console.log(`[SYSTEM] FFmpeg Transcoding PIPELINE SUCCESS for VideoID: ${videoId}. Status MARKED READY.`);
+
+      // MANDATORY: Emit sinyal selesai (ready 100%) ke UI seketika
+      io.emit('video-progress-' + videoId, { status: 'ready', progress: 100, encodingProgress: 100, url: highestResUrl });
+      if (uploadId) {
+        io.emit('encoding-progress-' + uploadId, { status: 'ready', progress: 100, encodingProgress: 100, url: highestResUrl });
+      }
+
       currentTranscodingVideoId = null;
-      
-      // GUARANTEED RESOLVE explicitly to release the PQueue lock!
-      return resolveQueue();
+
+      // LEPASKAN KUNCI ANTREAN SEGERA agar video berikutnya dapat langsung memulai encoding!
+      resolveQueue();
+
+      // Jalankan pembuatan laporan Gemini AI secara asinkron di background (NON-BLOCKING)
+      if (aiVideoCandidatePath) {
+        generateGeminiAutoReportAsync(videoId, aiVideoCandidatePath, isAiVideoTemp).catch((err) => {
+          console.error(`[GEMINI ASYNC ERROR] untuk VideoID ${videoId}:`, err);
+        });
+      }
     } catch (error: any) {
       console.error(`[SYSTEM] PIPELINE ERROR for VideoID: ${videoId}:`, error.message || error);
       await db.execute('UPDATE Videos SET status = ? WHERE id = ?', ['failed', videoId]);
       io.emit('video-progress-' + videoId, { status: 'failed', error: error.message || 'Processing failed' });
+      if (uploadId) {
+        io.emit('encoding-progress-' + uploadId, { status: 'failed', error: error.message || 'Processing failed' });
+      }
       await systemLog('ERROR', 'FFmpeg', `Multi-resolution processing failed for video ${videoId}`, { error: error.message });
       
       // Cleanup source file (Stage 1.6)
@@ -1320,8 +1510,7 @@ app.get('/api/auth/me', authenticate, async (req: any, res) => {
       if (tickets.length === 0) return res.status(404).json({ error: 'Tiket tidak valid' });
       if (tickets[0].status !== 'approved') return res.status(403).json({ error: 'Tiket belum disetujui atau sudah hangus' });
 
-      // Hash password baru (Asumsi bcrypt sudah tersedia di scope atas file)
-      const bcrypt = await import('bcrypt');
+      // Hash password baru menggunakan bcryptjs dari scope atas file
       const hashedPassword = await bcrypt.hash(newPassword, 10);
 
       // Update password user & hanguskan tiket
@@ -1388,7 +1577,6 @@ app.get('/api/auth/me', authenticate, async (req: any, res) => {
       // Jika user ingin ganti password, wajib validasi password lama
       if (newPassword && currentPassword) {
         const [users]: any = await db.query('SELECT password FROM users WHERE id = ?', [userId]);
-        const bcrypt = await import('bcrypt');
         const isMatch = await bcrypt.compare(currentPassword, users[0].password);
         
         if (!isMatch) return res.status(400).json({ error: 'Password saat ini salah!' });
@@ -1462,8 +1650,8 @@ app.get('/api/studio/videos', authenticate, async (req: any, res) => {
   try {
     const [videos]: any = await db.execute(`
       SELECT v.*, 
-        (SELECT COUNT(id) FROM Views WHERE video_id = v.id) as views,
-        (SELECT COALESCE(SUM(duration), 0) FROM video_analytics WHERE video_id = v.id) as watch_time 
+        GREATEST(COALESCE(v.views, 0), (SELECT COUNT(id) FROM Views WHERE video_id = v.id)) as views,
+        GREATEST(COALESCE(v.watch_time, 0), (SELECT COALESCE(SUM(duration), 0) FROM video_analytics WHERE video_id = v.id)) as watch_time 
       FROM Videos v 
       WHERE v.user_id = ? 
       ORDER BY v.created_at DESC
@@ -1883,6 +2071,44 @@ app.patch('/api/videos/:id', authenticate, async (req: any, res) => {
   }
 });
 
+app.post('/api/videos/:id/generate-report', authenticate, async (req: any, res) => {
+  console.log('[API CALL] ' + req.originalUrl);
+  const videoId = parseInt(req.params.id, 10);
+  if (isNaN(videoId)) return res.status(400).json({ error: 'ID video tidak valid' });
+
+  try {
+    const [rows]: any = await db.query('SELECT id, status FROM Videos WHERE id = ?', [videoId]);
+    if (!rows || rows.length === 0) return res.status(404).json({ error: 'Video tidak ditemukan' });
+
+    // Cari file resolusi dari VideoResolutions atau PROCESSED_DIR (prioritas 360p atau 480p)
+    const [resRows]: any = await db.query('SELECT resolution FROM VideoResolutions WHERE video_id = ?', [videoId]);
+    let targetRes = '360p';
+    if (resRows && resRows.length > 0) {
+      const available = resRows.map((r: any) => r.resolution);
+      if (available.includes('360p')) targetRes = '360p';
+      else if (available.includes('480p')) targetRes = '480p';
+      else targetRes = available[0];
+    }
+
+    const omniPath = path.join(PROCESSED_DIR, `processed-${videoId}-${targetRes}.mp4.omni`);
+    if (!fs.existsSync(omniPath)) {
+      return res.status(404).json({ error: 'Berkas video tidak ditemukan untuk analisis AI' });
+    }
+
+    const tempAiPath = path.join(PROCESSED_DIR, `temp-ai-${videoId}.mp4`);
+    fs.copyFileSync(omniPath, tempAiPath);
+    obfuscateFileInPlace(tempAiPath);
+
+    generateGeminiAutoReportAsync(videoId, tempAiPath, true).catch((err) => {
+      console.error(`[MANUAL GEMINI ERROR] untuk VideoID ${videoId}:`, err);
+    });
+
+    res.json({ success: true, message: 'Pembuatan laporan AI dimulai di background' });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Gagal memproses pembuatan laporan' });
+  }
+});
+
 // --- BULK VIDEO DELETION ENDPOINT (TAHAP 51) ---
 app.post('/api/videos/bulk-delete', authenticate, async (req: any, res) => {
   const { videoIds } = req.body;
@@ -2058,14 +2284,41 @@ app.get('/api/search', async (req, res) => {
 app.get('/api/videos', async (req, res) => {
   console.log('[API CALL] ' + req.originalUrl);
   try {
-    const { q } = req.query;
-    let query = "SELECT v.*, u.firstName, u.lastName FROM Videos v JOIN Users u ON v.user_id = u.id WHERE v.status = 'ready'";
+    const { q, category, sort, limit } = req.query;
+    let query = "SELECT v.*, u.firstName, u.lastName, u.avatar_url FROM Videos v JOIN Users u ON v.user_id = u.id WHERE v.status = 'ready' AND (v.visibility = 'public' OR v.visibility IS NULL)";
     const params: any[] = [];
     if (q) {
-      query += ' AND v.title LIKE ?';
-      params.push(`%${q}%`);
+      query += ' AND (v.title LIKE ? OR v.description LIKE ?)';
+      params.push(`%${q}%`, `%${q}%`);
     }
-    query += ' ORDER BY v.created_at DESC';
+    if (category && category !== 'all' && category !== '0') {
+      const catLower = String(category).toLowerCase();
+      if (catLower === 'arduino') {
+        query += ' AND (v.program_id IN (1, 2, 3) OR v.title LIKE "%arduino%" OR v.description LIKE "%arduino%")';
+      } else if (catLower === 'robotika' || catLower === 'robotic') {
+        query += ' AND (v.program_id IN (4, 5) OR v.title LIKE "%robotic%" OR v.description LIKE "%robotic%")';
+      } else if (catLower === 'python') {
+        query += ' AND (v.program_id IN (8, 9, 11, 12) OR v.title LIKE "%python%" OR v.description LIKE "%python%")';
+      } else if (catLower === 'web' || catLower === 'programming') {
+        query += ' AND (v.program_id IN (6, 7, 10, 13) OR v.title LIKE "%web%" OR v.title LIKE "%figma%" OR v.description LIKE "%web%")';
+      } else if (catLower === 'edukasi' || catLower === 'education') {
+        query += ' AND (v.category_id = 2 OR v.description LIKE "%pembelajaran%" OR v.description LIKE "%materi%")';
+      } else if (!isNaN(Number(category))) {
+        query += ' AND (v.category_id = ? OR v.program_id = ?)';
+        params.push(category, category);
+      } else {
+        query += ' AND (v.title LIKE ? OR v.description LIKE ?)';
+        params.push(`%${category}%`, `%${category}%`);
+      }
+    }
+    if (sort === 'trending' || sort === 'views') {
+      query += ' ORDER BY v.views DESC, v.created_at DESC';
+    } else {
+      query += ' ORDER BY v.created_at DESC';
+    }
+    if (limit && !isNaN(Number(limit))) {
+      query += ` LIMIT ${parseInt(String(limit), 10)}`;
+    }
     const [videos]: any = await db.execute(query, params);
     res.json(videos);
   } catch (error) {
@@ -2074,32 +2327,120 @@ app.get('/api/videos', async (req, res) => {
   }
 });
 
-app.post('/api/videos/:id/view', async (req, res) => {
+app.post('/api/videos/:id/view', optionalAuthenticate, async (req: any, res) => {
   try {
-    const videoId = req.params.id;
-    await db.execute('UPDATE Videos SET views = views + 1 WHERE id = ?', [videoId]);
+    const videoId = parseInt(req.params.id, 10);
+    if (isNaN(videoId)) return res.status(400).json({ error: 'ID video tidak valid' });
+
+    const userId = req.user?.id || null;
+
+    // 1. Tambah views di tabel Videos
+    await db.execute('UPDATE Videos SET views = COALESCE(views, 0) + 1 WHERE id = ?', [videoId]);
     
-    // Also track in video_stats if needed, but video_stats might just accumulate
-    await db.execute(
-      "INSERT INTO video_stats (video_id, views) VALUES (?, 1) ON DUPLICATE KEY UPDATE views = views + 1",
-      [videoId]
-    );
-    
-    res.json({ success: true });
+    // 2. Catat riwayat di tabel Views
+    try {
+      await db.execute('INSERT INTO Views (video_id, user_id) VALUES (?, ?)', [videoId, userId]);
+    } catch (viewErr) {
+      console.warn('[VIEW LOG WARNING]:', viewErr);
+    }
+
+    // 3. Catat di video_stats untuk analitik agregat
+    try {
+      await db.execute(
+        "INSERT INTO video_stats (video_id, views) VALUES (?, 1) ON DUPLICATE KEY UPDATE views = views + 1",
+        [videoId]
+      );
+    } catch (statsErr) {
+      /* ignore */
+    }
+
+    // 4. Catat ke WatchHistory jika user sedang login
+    if (userId) {
+      try {
+        const [existing]: any = await db.query(
+          'SELECT id FROM WatchHistory WHERE user_id = ? AND video_id = ?',
+          [userId, videoId]
+        );
+        if (existing && existing.length > 0) {
+          await db.execute(
+            'UPDATE WatchHistory SET watched_at = NOW() WHERE id = ?',
+            [existing[0].id]
+          );
+        } else {
+          await db.execute(
+            'INSERT INTO WatchHistory (user_id, video_id, watched_at, watch_time) VALUES (?, ?, NOW(), 0)',
+            [userId, videoId]
+          );
+        }
+      } catch (histErr) {
+        console.error('[WATCH HISTORY ERROR]:', histErr);
+      }
+    }
+
+    // 5. Ambil data views terbaru untuk dikembalikan ke frontend
+    const [rows]: any = await db.query('SELECT views FROM Videos WHERE id = ?', [videoId]);
+    const latestViews = rows && rows.length > 0 ? Number(rows[0].views) : 1;
+
+    // Emit socket agar UI lain yang sedang terbuka otomatis sinkron
+    io.emit('video-views-update', { videoId, views: latestViews });
+
+    res.json({ success: true, views: latestViews });
   } catch (error) {
     console.error('Update view error:', error);
     res.status(500).json({ error: 'Failed to update view' });
   }
 });
 
-app.post('/api/videos/:id/heartbeat', async (req, res) => {
+app.post('/api/videos/:id/heartbeat', optionalAuthenticate, async (req: any, res) => {
   try {
-    const videoId = req.params.id;
-    const increment = 10; // 10 seconds per heartbeat
-    await db.execute(
-      "INSERT INTO video_stats (video_id, watch_time_seconds) VALUES (?, ?) ON DUPLICATE KEY UPDATE watch_time_seconds = watch_time_seconds + ?",
-      [videoId, increment, increment]
-    );
+    const videoId = parseInt(req.params.id, 10);
+    if (isNaN(videoId)) return res.status(400).json({ error: 'ID video tidak valid' });
+
+    const increment = 10; // 10 detik per heartbeat
+    const userId = req.user?.id || null;
+
+    // 1. Akumulasi watch_time di tabel Videos
+    await db.execute('UPDATE Videos SET watch_time = COALESCE(watch_time, 0) + ? WHERE id = ?', [increment, videoId]);
+
+    // 2. Akumulasi di video_stats
+    try {
+      await db.execute(
+        "INSERT INTO video_stats (video_id, watch_time_seconds) VALUES (?, ?) ON DUPLICATE KEY UPDATE watch_time_seconds = watch_time_seconds + ?",
+        [videoId, increment, increment]
+      );
+    } catch (e) { /* ignore */ }
+
+    // 3. Catat ke video_analytics
+    try {
+      await db.execute(
+        'INSERT INTO video_analytics (video_id, user_id, duration) VALUES (?, ?, ?)',
+        [videoId, userId, increment]
+      );
+    } catch (e) { /* ignore */ }
+
+    // 4. Update durasi tonton di WatchHistory jika user login
+    if (userId) {
+      try {
+        const [existing]: any = await db.query(
+          'SELECT id FROM WatchHistory WHERE user_id = ? AND video_id = ?',
+          [userId, videoId]
+        );
+        if (existing && existing.length > 0) {
+          await db.execute(
+            'UPDATE WatchHistory SET watch_time = COALESCE(watch_time, 0) + ?, watched_at = NOW() WHERE id = ?',
+            [increment, existing[0].id]
+          );
+        } else {
+          await db.execute(
+            'INSERT INTO WatchHistory (user_id, video_id, watched_at, watch_time) VALUES (?, ?, NOW(), ?)',
+            [userId, videoId, increment]
+          );
+        }
+      } catch (e) {
+        console.error('[HEARTBEAT HISTORY ERROR]:', e);
+      }
+    }
+
     res.sendStatus(200);
   } catch (error) {
     console.error('Heartbeat error:', error);
@@ -2107,36 +2448,111 @@ app.post('/api/videos/:id/heartbeat', async (req, res) => {
   }
 });
 
+// ============================================================================
+// WATCH HISTORY ENDPOINTS (RIWAYAT TONTONAN)
+// ============================================================================
+app.get('/api/history', authenticate, async (req: any, res) => {
+  try {
+    const userId = req.user.id;
+    const [historyRows]: any = await db.query(`
+      SELECT 
+        wh.id as history_id,
+        wh.watched_at,
+        wh.watch_time,
+        v.id,
+        v.title,
+        v.description,
+        v.url,
+        v.thumbnail,
+        v.thumbnail_url,
+        v.views,
+        v.created_at,
+        v.duration,
+        v.status,
+        u.id as user_id,
+        u.firstName,
+        u.lastName
+      FROM WatchHistory wh
+      JOIN Videos v ON wh.video_id = v.id
+      LEFT JOIN Users u ON v.user_id = u.id
+      WHERE wh.user_id = ? AND v.deleted_at IS NULL
+      ORDER BY wh.watched_at DESC
+    `, [userId]);
+
+    res.json(historyRows || []);
+  } catch (error: any) {
+    console.error('Fetch watch history error:', error);
+    res.status(500).json({ error: 'Failed to fetch watch history' });
+  }
+});
+
+app.delete('/api/history/:id', authenticate, async (req: any, res) => {
+  try {
+    const userId = req.user.id;
+    const historyId = parseInt(req.params.id, 10);
+    if (isNaN(historyId)) return res.status(400).json({ error: 'ID riwayat tidak valid' });
+
+    await db.execute('DELETE FROM WatchHistory WHERE id = ? AND user_id = ?', [historyId, userId]);
+    res.json({ success: true, message: 'Item riwayat berhasil dihapus' });
+  } catch (error: any) {
+    console.error('Delete history item error:', error);
+    res.status(500).json({ error: 'Gagal menghapus item riwayat' });
+  }
+});
+
+app.delete('/api/history', authenticate, async (req: any, res) => {
+  try {
+    const userId = req.user.id;
+    await db.execute('DELETE FROM WatchHistory WHERE user_id = ?', [userId]);
+    res.json({ success: true, message: 'Seluruh riwayat tontonan berhasil dibersihkan' });
+  } catch (error: any) {
+    console.error('Clear history error:', error);
+    res.status(500).json({ error: 'Gagal membersihkan riwayat tontonan' });
+  }
+});
+
 app.get('/api/creator/analytics', authenticate, async (req: any, res) => {
   try {
     const creatorId = req.user.id;
     
-    // Global stats
+    // Global stats: dihitung langsung dari data riil tabel Videos milik kreator ini
     const [globalStats]: any = await db.query(`
       SELECT 
         COUNT(v.id) as totalVideos,
-        SUM(COALESCE(vs.views, 0)) as totalViews,
-        SUM(COALESCE(vs.watch_time_seconds, 0)) / 60 as totalWatchTime,
-        (SELECT COUNT(*) FROM Likes l JOIN Videos v2 ON l.video_id = v2.id WHERE v2.user_id = ? AND type = 'like') as totalLikes,
+        COALESCE(SUM(GREATEST(COALESCE(v.views, 0), COALESCE((SELECT COUNT(id) FROM Views WHERE video_id = v.id), 0))), 0) as totalViews,
+        COALESCE(SUM(GREATEST(COALESCE(v.watch_time, 0), COALESCE((SELECT SUM(duration) FROM video_analytics WHERE video_id = v.id), 0))), 0) as totalWatchTime,
+        (SELECT COUNT(*) FROM Likes l JOIN Videos v2 ON l.video_id = v2.id WHERE v2.user_id = ? AND l.type = 'like') as totalLikes,
         (SELECT COUNT(*) FROM Comments c JOIN Videos v3 ON c.video_id = v3.id WHERE v3.user_id = ?) as totalComments
       FROM Videos v
-      LEFT JOIN video_stats vs ON v.id = vs.video_id
-      WHERE v.user_id = ?
+      WHERE v.user_id = ? AND v.deleted_at IS NULL
     `, [creatorId, creatorId, creatorId]);
 
     // Per-video stats
     const [videoStats]: any = await db.query(`
       SELECT 
-        v.id, v.title, 
-        COALESCE(vs.views, 0) as views,
+        v.id, 
+        v.title, 
+        v.thumbnail_url,
+        v.thumbnail,
+        v.duration,
+        v.created_at,
+        GREATEST(COALESCE(v.views, 0), COALESCE((SELECT COUNT(id) FROM Views WHERE video_id = v.id), 0)) as views,
+        GREATEST(COALESCE(v.watch_time, 0), COALESCE((SELECT SUM(duration) FROM video_analytics WHERE video_id = v.id), 0)) as watch_time,
         (SELECT COUNT(*) FROM Likes WHERE video_id = v.id AND type = 'like') as likes,
-        (SELECT COUNT(*) FROM Comments WHERE video_id = v.id) as comments,
-        COALESCE(vs.watch_time_seconds, 0) / 60 as watch_time
+        (SELECT COUNT(*) FROM Comments WHERE video_id = v.id) as comments
       FROM Videos v
-      LEFT JOIN video_stats vs ON v.id = vs.video_id
-      WHERE v.user_id = ?
+      WHERE v.user_id = ? AND v.deleted_at IS NULL
       ORDER BY v.created_at DESC
     `, [creatorId]);
+
+    const formattedVideos = videoStats.map((v: any) => ({
+      ...v,
+      views: Number(v.views) || 0,
+      watch_time: Number(v.watch_time) || 0,
+      watch_time_seconds: Number(v.watch_time) || 0,
+      likes: Number(v.likes) || 0,
+      comments: Number(v.comments) || 0
+    }));
 
     res.json({
       global: {
@@ -2146,7 +2562,7 @@ app.get('/api/creator/analytics', authenticate, async (req: any, res) => {
         totalLikes: Number(globalStats[0]?.totalLikes) || 0,
         totalComments: Number(globalStats[0]?.totalComments) || 0
       },
-      videos: videoStats
+      videos: formattedVideos
     });
   } catch (error) {
     console.error('Fetch creator analytics error:', error);
@@ -2157,7 +2573,7 @@ app.get('/api/creator/analytics', authenticate, async (req: any, res) => {
 app.get('/api/videos/:id', async (req, res) => {
   console.log('[API CALL] ' + req.originalUrl);
   try {
-    const [videos]: any = await db.execute('SELECT v.*, u.firstName, u.lastName FROM Videos v JOIN Users u ON v.user_id = u.id WHERE v.id = ?', [req.params.id]);
+    const [videos]: any = await db.execute('SELECT v.*, u.firstName, u.lastName, u.firstName AS first_name, u.lastName AS last_name FROM Videos v LEFT JOIN Users u ON v.user_id = u.id WHERE v.id = ?', [req.params.id]);
     if (videos.length === 0) return res.status(404).json({ error: 'Video not found' });
     res.json(videos[0]);
   } catch (error) {
@@ -2185,11 +2601,16 @@ app.post('/api/videos/:id/comments', authenticate, async (req: any, res) => {
   }
 });
 
-app.get('/api/videos/:id/likes', async (req, res) => {
+app.get('/api/videos/:id/likes', optionalAuthenticate, async (req: any, res) => {
   try {
     const [likes]: any = await db.execute("SELECT COUNT(*) as count FROM Likes WHERE video_id = ? AND type = 'like'", [req.params.id]);
     const [dislikes]: any = await db.execute("SELECT COUNT(*) as count FROM Likes WHERE video_id = ? AND type = 'dislike'", [req.params.id]);
-    res.json({ likes: likes[0].count, dislikes: dislikes[0].count, userAction: null });
+    let userAction: 'like' | 'dislike' | null = null;
+    if (req.user?.id) {
+      const [userLike]: any = await db.execute("SELECT type FROM Likes WHERE video_id = ? AND user_id = ?", [req.params.id, req.user.id]);
+      if (userLike.length > 0) userAction = userLike[0].type;
+    }
+    res.json({ likes: likes[0].count, dislikes: dislikes[0].count, userAction });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch likes' });
   }
@@ -2218,9 +2639,86 @@ app.post('/api/videos/:id/like', authenticate, async (req: any, res) => {
   }
 });
 
+// --- API: Daftar Video yang Disukai (Liked Videos) ---
+app.get('/api/videos/liked', authenticate, async (req: any, res) => {
+  try {
+    const userId = req.user.id;
+    const query = `
+      SELECT v.*, u.firstName, u.lastName, u.avatar_url, l.created_at AS liked_at 
+      FROM Likes l 
+      JOIN Videos v ON l.video_id = v.id 
+      JOIN Users u ON v.user_id = u.id 
+      WHERE l.user_id = ? AND l.type = 'like' AND v.status = 'ready'
+      ORDER BY l.created_at DESC
+    `;
+    const [videos]: any = await db.execute(query, [userId]);
+    res.json(videos);
+  } catch (error) {
+    console.error('Fetch liked videos error:', error);
+    res.status(500).json({ error: 'Failed to fetch liked videos' });
+  }
+});
+
+// --- API: Daftar Video Tonton Nanti (Watch Later) ---
+app.get('/api/watch-later', authenticate, async (req: any, res) => {
+  try {
+    const userId = req.user.id;
+    const query = `
+      SELECT v.*, u.firstName, u.lastName, u.avatar_url, w.created_at AS saved_at 
+      FROM WatchLater w 
+      JOIN Videos v ON w.video_id = v.id 
+      JOIN Users u ON v.user_id = u.id 
+      WHERE w.user_id = ? AND v.status = 'ready'
+      ORDER BY w.created_at DESC
+    `;
+    const [videos]: any = await db.execute(query, [userId]);
+    res.json(videos);
+  } catch (error) {
+    console.error('Fetch watch later error:', error);
+    res.status(500).json({ error: 'Failed to fetch watch later videos' });
+  }
+});
+
+app.post('/api/watch-later/:id', authenticate, async (req: any, res) => {
+  try {
+    const videoId = req.params.id;
+    const userId = req.user.id;
+    const [existing]: any = await db.execute('SELECT id FROM WatchLater WHERE user_id = ? AND video_id = ?', [userId, videoId]);
+    if (existing.length > 0) {
+      await db.execute('DELETE FROM WatchLater WHERE id = ?', [existing[0].id]);
+      return res.json({ success: true, saved: false, message: 'Dihapus dari Tonton Nanti' });
+    } else {
+      await db.execute('INSERT INTO WatchLater (user_id, video_id) VALUES (?, ?)', [userId, videoId]);
+      return res.json({ success: true, saved: true, message: 'Disimpan ke Tonton Nanti' });
+    }
+  } catch (error) {
+    console.error('Toggle watch later error:', error);
+    res.status(500).json({ error: 'Failed to update watch later' });
+  }
+});
+
+app.get('/api/watch-later/check/:id', optionalAuthenticate, async (req: any, res) => {
+  try {
+    if (!req.user?.id) return res.json({ saved: false });
+    const [existing]: any = await db.execute('SELECT id FROM WatchLater WHERE user_id = ? AND video_id = ?', [req.user.id, req.params.id]);
+    res.json({ saved: existing.length > 0 });
+  } catch (error) {
+    res.json({ saved: false });
+  }
+});
+
+app.delete('/api/watch-later/:id', authenticate, async (req: any, res) => {
+  try {
+    await db.execute('DELETE FROM WatchLater WHERE user_id = ? AND video_id = ?', [req.user.id, req.params.id]);
+    res.json({ success: true, message: 'Video dihapus dari Tonton Nanti' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to remove from watch later' });
+  }
+});
+
 app.get('/api/videos/:id/related', async (req, res) => {
   try {
-    const [videos]: any = await db.execute("SELECT v.*, u.firstName, u.lastName FROM Videos v JOIN Users u ON v.user_id = u.id WHERE v.status = 'ready' AND v.id != ? LIMIT 10", [req.params.id]);
+    const [videos]: any = await db.execute("SELECT v.*, u.firstName, u.lastName, u.firstName AS first_name, u.lastName AS last_name FROM Videos v LEFT JOIN Users u ON v.user_id = u.id WHERE v.status = 'ready' AND v.id != ? ORDER BY v.id DESC LIMIT 10", [req.params.id]);
     res.json(videos);
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch related videos' });
@@ -2329,36 +2827,73 @@ app.get('/api/videos/:id/resolutions', async (req, res) => {
   }
 });
 
-app.get('/api/channels/:id', async (req, res) => {
+app.get('/api/channels/:id', optionalAuthenticate, async (req: any, res) => {
   try {
+    const creatorId = req.params.id;
     const [rows]: any = await db.query(`
       SELECT 
         u.id,
+        u.firstName,
+        u.lastName,
         CONCAT(u.firstName, ' ', u.lastName) AS fallback_name,
-        c.channel_name,
-        c.description,
-        c.avatar_url,
-        c.banner_url,
-        (SELECT COUNT(*) FROM Videos WHERE user_id = u.id) AS total_videos,
-        (SELECT SUM(views) FROM Videos WHERE user_id = u.id) AS total_views
+        u.avatar_url,
+        (SELECT COUNT(*) FROM Videos WHERE user_id = u.id AND status = 'ready') AS total_videos,
+        (SELECT COALESCE(SUM(views), 0) FROM Videos WHERE user_id = u.id) AS total_views
       FROM Users u
-      LEFT JOIN Channels c ON u.id = c.user_id
       WHERE u.id = ?
-    `, [req.params.id]);
+    `, [creatorId]);
 
     if (rows.length === 0) {
       return res.status(404).json({ error: 'Creator not found' });
     }
     
     const user = rows[0];
+
+    // Cek jumlah subscriber (dukung tabel Subscriptions dan Follows)
+    let subscriberCount = 0;
+    try {
+      const [subRows]: any = await db.query(
+        "SELECT COUNT(*) AS count FROM Subscriptions WHERE leader_id = ? OR channel_id = ?",
+        [creatorId, creatorId]
+      );
+      subscriberCount = subRows[0]?.count || 0;
+    } catch (e) {
+      try {
+        const [followRows]: any = await db.query("SELECT COUNT(*) AS count FROM Follows WHERE following_id = ?", [creatorId]);
+        subscriberCount = followRows[0]?.count || 0;
+      } catch (e2) {}
+    }
+
+    // Cek status subscribe user saat ini
+    let isSubscribed = false;
+    if (req.user?.id) {
+      try {
+        const [mySub]: any = await db.query(
+          "SELECT id FROM Subscriptions WHERE subscriber_id = ? AND (leader_id = ? OR channel_id = ?)",
+          [req.user.id, creatorId, creatorId]
+        );
+        isSubscribed = mySub.length > 0;
+      } catch (e) {
+        try {
+          const [myFollow]: any = await db.query(
+            "SELECT id FROM Follows WHERE follower_id = ? AND following_id = ?",
+            [req.user.id, creatorId]
+          );
+          isSubscribed = myFollow.length > 0;
+        } catch (e2) {}
+      }
+    }
+
     res.json({
       id: user.id,
-      channel_name: user.channel_name || user.fallback_name,
-      description: user.description || '',
+      firstName: user.firstName,
+      lastName: user.lastName,
+      channel_name: user.fallback_name,
       avatar_url: user.avatar_url || null,
-      banner_url: user.banner_url || null,
-      total_videos: user.total_videos || 0,
-      total_views: user.total_views || 0
+      total_videos: Number(user.total_videos) || 0,
+      total_views: Number(user.total_views) || 0,
+      subscriberCount: Number(subscriberCount) || 0,
+      isSubscribed: Boolean(isSubscribed)
     });
   } catch (error) {
     console.error('[API CHANNELS ERROR]:', error);
@@ -2369,21 +2904,14 @@ app.get('/api/channels/:id', async (req, res) => {
 app.get('/api/channels/:id/videos', async (req, res) => {
   try {
     const [videos]: any = await db.execute(`
-      SELECT v.*, 
-        (SELECT COUNT(id) FROM Views WHERE video_id = v.id) as views,
-        (SELECT COALESCE(SUM(duration), 0) FROM video_analytics WHERE video_id = v.id) as watch_time 
+      SELECT v.*, u.firstName, u.lastName, u.avatar_url
       FROM Videos v 
-      WHERE v.user_id = ? AND v.processing_status = 'ready' 
+      JOIN Users u ON v.user_id = u.id
+      WHERE v.user_id = ? AND v.status = 'ready'
       ORDER BY v.created_at DESC
     `, [req.params.id]);
 
-    const processedVideos = videos.map((v: any) => ({
-      ...v,
-      watch_time: Number(v.watch_time) || 0,
-      views: Number(v.views) || 0
-    }));
-
-    res.json(processedVideos || []);
+    res.json(videos || []);
   } catch (error) {
     console.error('Fetch channel videos error:', error);
     res.status(500).json({ error: 'Failed to fetch channel videos' });
@@ -2427,6 +2955,26 @@ app.post('/api/playlists', authenticate, async (req: any, res) => {
   }
 });
 
+app.get('/api/playlists/:id', async (req, res) => {
+  try {
+    const [playlists]: any = await db.execute('SELECT p.*, u.firstName, u.lastName, u.firstName AS first_name, u.lastName AS last_name FROM Playlists p LEFT JOIN Users u ON p.user_id = u.id WHERE p.id = ?', [req.params.id]);
+    if (playlists.length === 0) return res.status(404).json({ error: 'Playlist not found' });
+    const playlist = playlists[0];
+    const [videos]: any = await db.execute(`
+      SELECT v.*, u.firstName, u.lastName, u.firstName AS first_name, u.lastName AS last_name 
+      FROM PlaylistVideos pv 
+      JOIN Videos v ON pv.video_id = v.id 
+      LEFT JOIN Users u ON v.user_id = u.id 
+      WHERE pv.playlist_id = ? 
+      ORDER BY pv.added_at ASC
+    `, [req.params.id]);
+    playlist.videos = videos;
+    res.json(playlist);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch playlist' });
+  }
+});
+
 // --- Admin RBAC & Encoding Config Routes ---
 app.get('/api/admin/logs', authenticate, isAdmin, async (req, res) => {
   try {
@@ -2466,6 +3014,13 @@ app.get('/api/admin/queue', authenticate, isAdmin, async (req, res) => {
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch queue' });
   }
+});
+
+app.post('/api/admin/restart', authenticate, isAdmin, async (req, res) => {
+  res.json({ success: true, message: 'Server is restarting...' });
+  setTimeout(() => {
+    process.exit(42);
+  }, 500);
 });
 
 app.get('/api/admin/settings', authenticate, isAdmin, async (req, res) => {
@@ -3226,7 +3781,18 @@ async function startServer() {
           UNIQUE KEY unique_sub (subscriber_id, leader_id)
         )
       `);
-      console.log('[SYSTEM] Analytics & system tables (Views, video_analytics, VideoResolutions, SystemLogs, video_stats, Subscriptions) verified/created successfully.');
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS WatchLater (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          user_id INT NOT NULL,
+          video_id INT NOT NULL,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE KEY unique_watch_later (user_id, video_id),
+          FOREIGN KEY (user_id) REFERENCES Users(id) ON DELETE CASCADE,
+          FOREIGN KEY (video_id) REFERENCES Videos(id) ON DELETE CASCADE
+        )
+      `);
+      console.log('[SYSTEM] Analytics & system tables (Views, video_analytics, VideoResolutions, SystemLogs, video_stats, Subscriptions, WatchLater) verified/created successfully.');
     } catch (analyticsError) {
       console.error('[SYSTEM] Failed to create analytics tables:', analyticsError);
     }
@@ -3364,35 +3930,70 @@ async function startServer() {
   });
 
   // --- RUTE KHUSUS DOWNLOAD VIDEO DEKRIPSI ---
-  app.get('/api/videos/download/:id', async (req, res) => {
+  const handleVideoDownload = async (req: any, res: any) => {
     try {
-      const resParam = req.query.res || '360';
-      const filePath = path.join(process.cwd(), 'processed', `processed-${req.params.id}-${resParam}.mp4.omni`);
-
-      if (!fs.existsSync(filePath)) {
-        return res.status(404).json({ error: 'Video file not found' });
+      const videoId = req.params.id;
+      let rawRes = String(req.query.res || 'original').toLowerCase();
+      
+      // Ambil metadata video dari database
+      const [videoRows]: any = await db.query('SELECT title, url, allow_download FROM Videos WHERE id = ?', [videoId]);
+      if (videoRows.length === 0) {
+        return res.status(404).json({ error: 'Video tidak ditemukan' });
       }
 
-      const stat = fs.statSync(filePath);
-      const fileSize = stat.size;
-
-      // Ambil judul asli dari database
-      const [videoRows]: any = await db.query('SELECT title FROM Videos WHERE id = ?', [req.params.id]);
       let safeTitle = 'Video';
-      if (videoRows.length > 0 && videoRows[0].title) {
+      if (videoRows[0].title) {
         // Sanitasi karakter ilegal untuk nama file Windows/Linux
         safeTitle = videoRows[0].title.replace(/[^a-zA-Z0-9 \-_]/g, '').trim();
       }
 
-      // Header paksaan Download (Attachment) dengan judul dinamis
+      // Coba temukan file fisik berdasarkan resolusi yang diminta
+      let filePath = '';
+      let chosenResLabel = rawRes;
+
+      const candidates: string[] = [];
+      if (rawRes !== 'original') {
+        const numOnly = rawRes.replace(/[^0-9]/g, '');
+        if (numOnly) {
+          candidates.push(`processed-${videoId}-${numOnly}p.mp4.omni`);
+          candidates.push(`processed-${videoId}-${numOnly}.mp4.omni`);
+        }
+        candidates.push(`processed-${videoId}-${rawRes}.mp4.omni`);
+      }
+      
+      // Fallback resolusi bertingkat jika file spesifik tidak ditemukan
+      candidates.push(`processed-${videoId}-1080p.mp4.omni`);
+      candidates.push(`processed-${videoId}-720p.mp4.omni`);
+      candidates.push(`processed-${videoId}-480p.mp4.omni`);
+      candidates.push(`processed-${videoId}-360p.mp4.omni`);
+
+      for (const cand of candidates) {
+        const p = path.join(process.cwd(), 'processed', cand);
+        if (fs.existsSync(p)) {
+          filePath = p;
+          const m = cand.match(/-([0-9]+p?)\./);
+          chosenResLabel = m ? m[1] : 'video';
+          break;
+        }
+      }
+
+      if (!filePath || !fs.existsSync(filePath)) {
+        return res.status(404).json({ error: 'File video tidak ditemukan di server' });
+      }
+
+      const stat = fs.statSync(filePath);
+      const fileSize = stat.size;
+      const cleanLabel = chosenResLabel.endsWith('p') ? chosenResLabel : `${chosenResLabel}p`;
+
+      // Header paksaan Download (Attachment) dengan judul dan resolusi rapi
       res.writeHead(200, {
         'Content-Length': fileSize,
         'Content-Type': 'video/mp4',
-        'Content-Disposition': `attachment; filename="${safeTitle} - ${resParam}p.mp4"`,
+        'Content-Disposition': `attachment; filename="${safeTitle} - ${cleanLabel}.mp4"`,
       });
 
       let bytesRead = 0;
-      const { Transform } = await import('stream');
+      const { Transform } = await import('node:stream');
       const deobfuscateStream = new Transform({
         transform(chunk, encoding, callback) {
           if (bytesRead < 100) {
@@ -3414,9 +4015,12 @@ async function startServer() {
       dlStream.pipe(deobfuscateStream).pipe(res);
     } catch (err) {
       console.error('[DOWNLOAD ERROR]', err);
-      res.status(500).end();
+      if (!res.headersSent) res.status(500).end();
     }
-  });
+  };
+
+  app.get('/api/videos/download/:id', handleVideoDownload);
+  app.get('/api/videos/:id/download', handleVideoDownload);
 
   // --- API LIVE CREDENTIALS TRACKER (TAHAP 43.3 ZONA PRIORITAS) ---
   app.get('/api/live/status', (req, res) => {

@@ -527,7 +527,7 @@ const updateTaskProgress = (taskId: string, patch: Partial<any>) => {
                           <option value="" className="bg-zinc-900 text-white hover:bg-zinc-800">-- Pilih Program --</option>
                           {programsList.map((prog) => (
                             <option key={prog.id} value={prog.id} className="bg-zinc-900 text-white hover:bg-zinc-800 py-2">
-                              {prog.program_name} ({prog.type === 'reset_monthly' ? 'Bulanan' : 'Kontinu'})
+                              {prog.program_name}
                             </option>
                           ))}
                         </select>

@@ -1,10 +1,19 @@
 import { useState, useEffect } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import api from '../lib/api';
-import { PlayCircle, Eye, Clock, Video, BarChart2, Calendar, LayoutDashboard } from 'lucide-react';
+import { PlayCircle, Eye, Clock, Video, BarChart2, Calendar, LayoutDashboard, UploadCloud } from 'lucide-react';
 import { motion } from 'motion/react';
 import { cn, formatWatchTime } from '../lib/utils';
 import { Skeleton } from '../components/Skeleton';
+
+const API_BASE_URL = (import.meta as any).env?.VITE_API_URL?.replace(/\/api\/?$/, '') || '';
+
+const getThumbnailUrl = (url?: string) => {
+  if (!url) return '';
+  if (url.startsWith('http') || url.startsWith('blob:')) return url;
+  const pathPart = url.startsWith('/') ? url : `/${url}`;
+  return `${API_BASE_URL}${pathPart}`;
+};
 
 export default function CreatorStudio() {
   const [overview, setOverview] = useState<any>(null);
@@ -17,7 +26,7 @@ export default function CreatorStudio() {
       try {
         const res = await api.get('/creator/analytics');
         setOverview(res.data.global);
-        setVideos(res.data.videos);
+        setVideos(res.data.videos || []);
       } catch (err) {
         console.error("Failed to fetch creator analytics", err);
       } finally {
@@ -26,11 +35,6 @@ export default function CreatorStudio() {
     };
     fetchAnalytics();
   }, []);
-
-  const getThumbnailUrl = (url: string) => {
-    if (!url) return '';
-    return url.startsWith('http') ? url : `http://localhost:3000${url}`;
-  };
 
   if (loading) {
     return (
@@ -144,49 +148,67 @@ export default function CreatorStudio() {
               </tr>
             </thead>
             <tbody className="divide-y divide-neutral-100 dark:divide-neutral-800">
-              {videos.map((video: any) => (
-                <tr key={video.id} className="hover:bg-neutral-50 dark:hover:bg-neutral-800/50 transition-colors group">
-                  <td className="py-4 px-6">
-                    <div className="flex items-center gap-4">
-                      <div className="w-24 h-14 bg-neutral-100 dark:bg-neutral-800 rounded-lg overflow-hidden shrink-0 relative">
-                        {video.thumbnail_url ? (
-                          <img 
-                            src={getThumbnailUrl(video.thumbnail_url)} 
-                            alt={video.title}
-                            className="w-full h-full object-cover"
-                          />
-                        ) : (
-                          <div className="w-full h-full flex items-center justify-center text-neutral-400">
-                            <PlayCircle size={20} />
-                          </div>
-                        )}
-                        <Link to={`/video/${video.id}`} className="absolute inset-0 z-10 block" />
+              {videos.map((video: any) => {
+                const thumbSrc = getThumbnailUrl(video.thumbnail_url || video.thumbnail);
+                return (
+                  <tr key={video.id} className="hover:bg-neutral-50 dark:hover:bg-neutral-800/50 transition-colors group">
+                    <td className="py-4 px-6">
+                      <div className="flex items-center gap-4">
+                        <div className="w-24 h-14 bg-neutral-100 dark:bg-neutral-800 rounded-lg overflow-hidden shrink-0 relative">
+                          {thumbSrc ? (
+                            <img 
+                              src={thumbSrc} 
+                              alt={video.title}
+                              className="w-full h-full object-cover"
+                              onError={(e) => {
+                                (e.target as HTMLElement).style.display = 'none';
+                              }}
+                            />
+                          ) : (
+                            <div className="w-full h-full flex items-center justify-center text-neutral-400">
+                              <PlayCircle size={20} />
+                            </div>
+                          )}
+                          <Link to={`/video/${video.id}`} className="absolute inset-0 z-10 block" />
+                        </div>
+                        <div className="font-semibold text-neutral-900 dark:text-white line-clamp-2 max-w-sm group-hover:text-brand-600 transition-colors">
+                          <Link to={`/video/${video.id}`}>
+                            {video.title}
+                          </Link>
+                        </div>
                       </div>
-                      <div className="font-semibold text-neutral-900 dark:text-white line-clamp-2 max-w-sm group-hover:text-brand-600 transition-colors">
-                        <Link to={`/video/${video.id}`}>
-                          {video.title}
-                        </Link>
+                    </td>
+                    <td className="py-4 px-6 text-sm text-neutral-500 font-medium whitespace-nowrap">
+                      <div className="flex items-center gap-2">
+                         <Calendar size={14} className="text-neutral-400 shadow-sm" />
+                         {video.created_at ? new Date(video.created_at).toLocaleDateString('id-ID', { day: 'numeric', month: 'short', year: 'numeric' }) : '-'}
                       </div>
-                    </div>
-                  </td>
-                  <td className="py-4 px-6 text-sm text-neutral-500 font-medium">
-                    <div className="flex items-center gap-2">
-                       <Calendar size={14} className="text-neutral-400 shadow-sm" />
-                       {new Date(video.created_at).toLocaleDateString()}
-                    </div>
-                  </td>
-                  <td className="py-4 px-6 text-right font-black text-neutral-900 dark:text-white">
-                    {Number(video.views || 0).toLocaleString()}
-                  </td>
-                  <td className="py-4 px-6 text-right font-black text-neutral-900 dark:text-white">
-                    {formatWatchTime(video.watch_time)}
-                  </td>
-                </tr>
-              ))}
+                    </td>
+                    <td className="py-4 px-6 text-right font-black text-neutral-900 dark:text-white whitespace-nowrap">
+                      {Number(video.views || 0).toLocaleString()}
+                    </td>
+                    <td className="py-4 px-6 text-right font-black text-neutral-900 dark:text-white whitespace-nowrap">
+                      {formatWatchTime(Number(video.watch_time ?? video.watch_time_seconds ?? 0))}
+                    </td>
+                  </tr>
+                );
+              })}
               {videos.length === 0 && (
                 <tr>
-                  <td colSpan={4} className="py-12 text-center text-neutral-500 font-medium">
-                    No videos found. Upload your first video to see analytics.
+                  <td colSpan={4} className="py-16 text-center text-neutral-500 font-medium">
+                    <div className="flex flex-col items-center justify-center gap-3">
+                      <div className="w-14 h-14 rounded-2xl bg-neutral-100 dark:bg-neutral-800 flex items-center justify-center text-neutral-400">
+                        <UploadCloud size={28} />
+                      </div>
+                      <p className="text-neutral-600 dark:text-neutral-300 font-semibold">Belum ada video yang diunggah</p>
+                      <p className="text-xs text-neutral-400 max-w-sm">Unggah video pertama Anda untuk mulai melihat ringkasan statistik performa di sini.</p>
+                      <Link 
+                        to="/upload" 
+                        className="mt-2 inline-flex items-center gap-2 bg-brand-600 text-white px-5 py-2.5 rounded-xl font-bold text-xs uppercase tracking-wider hover:bg-brand-700 transition-colors shadow-md"
+                      >
+                        Unggah Video Sekarang
+                      </Link>
+                    </div>
                   </td>
                 </tr>
               )}
