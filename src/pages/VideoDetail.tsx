@@ -178,26 +178,37 @@ export default function VideoDetailPage() {
   // Player HLS Live Stream Integration
   useEffect(() => {
     if (video && (video.status === 'live' || video.url?.endsWith('.m3u8'))) {
-        const hlsUrl = video.url.startsWith('http') 
-            ? video.url 
-            : `http://${window.location.hostname}:8005${video.url}`;
+      const hlsUrl = video.url.startsWith('http') 
+        ? video.url 
+        : `${window.location.origin}${video.url.startsWith('/') ? '' : '/'}${video.url}`;
 
-        if (videoRef.current) {
-            if (videoRef.current.canPlayType('application/vnd.apple.mpegurl')) {
-                videoRef.current.src = hlsUrl;
-            } else {
-                const script = document.createElement('script');
-                script.src = 'https://cdn.jsdelivr.net/npm/hls.js@latest';
-                script.onload = () => {
-                    if ((window as any).Hls && (window as any).Hls.isSupported()) {
-                        const hls = new (window as any).Hls();
-                        hls.loadSource(hlsUrl);
-                        hls.attachMedia(videoRef.current);
-                    }
-                };
-                document.body.appendChild(script);
-            }
+      const attachHls = () => {
+        if (!videoRef.current) return;
+        if (videoRef.current.canPlayType('application/vnd.apple.mpegurl')) {
+          videoRef.current.src = hlsUrl;
+          videoRef.current.play().catch(() => {});
+        } else if ((window as any).Hls && (window as any).Hls.isSupported()) {
+          const hls = new (window as any).Hls({
+            manifestLoadingTimeOut: 15000,
+            manifestLoadingMaxRetry: 10,
+            liveSyncDurationCount: 3,
+          });
+          hls.loadSource(hlsUrl);
+          hls.attachMedia(videoRef.current);
+          hls.on((window as any).Hls.Events.MANIFEST_PARSED, () => {
+            videoRef.current?.play().catch(() => {});
+          });
         }
+      };
+
+      if ((window as any).Hls) {
+        attachHls();
+      } else {
+        const script = document.createElement('script');
+        script.src = 'https://cdn.jsdelivr.net/npm/hls.js@latest';
+        script.onload = attachHls;
+        document.body.appendChild(script);
+      }
     }
   }, [video]);
 
@@ -408,7 +419,11 @@ export default function VideoDetailPage() {
                   className="bg-black/70 backdrop-blur-md text-white px-3 py-1.5 rounded-xl text-[11px] font-bold tracking-wide flex items-center gap-1.5 hover:bg-black/90 transition-all border border-white/10 shadow-lg"
                 >
                   <Settings size={13} className={showQualityMenu ? 'animate-spin' : ''} />
-                  <span>{currentResolution ? (String(currentResolution).endsWith('p') ? currentResolution : `${currentResolution}p`) : 'Kualitas'}</span>
+                  <span>
+                    {video?.status === 'live' 
+                      ? '🔴 Siaran Langsung' 
+                      : (currentResolution ? (String(currentResolution).endsWith('p') ? currentResolution : `${currentResolution}p`) : 'Kualitas')}
+                  </span>
                 </button>
                 
                 <AnimatePresence>
@@ -417,30 +432,37 @@ export default function VideoDetailPage() {
                       initial={{ opacity: 0, scale: 0.95, y: 5 }}
                       animate={{ opacity: 1, scale: 1, y: 0 }}
                       exit={{ opacity: 0, scale: 0.95, y: 5 }}
-                      className="absolute right-0 top-full mt-2 w-36 max-h-[50vh] overflow-y-auto bg-[#1f1f1f] backdrop-blur-2xl border border-white/10 rounded-xl shadow-2xl p-1 z-50 no-scrollbar"
+                      className="absolute right-0 top-full mt-2 w-44 max-h-[50vh] overflow-y-auto bg-[#1f1f1f] backdrop-blur-2xl border border-white/10 rounded-xl shadow-2xl p-1 z-50 no-scrollbar"
                     >
                       <div className="px-3 py-1.5 text-[10px] font-bold text-neutral-400 uppercase tracking-wider border-b border-white/5 mb-1">
-                        Kualitas Video
+                        {video?.status === 'live' ? 'Mode Streaming' : 'Kualitas Video'}
                       </div>
-                      {resolutions.map((item: any) => {
-                        const resLabel = String(item.res || item).endsWith('p') ? (item.res || item) : `${item.res || item}p`;
-                        return (
-                          <button 
-                            key={item.res || item}
-                            onClick={() => {
-                              setCurrentResolution(item.res || item);
-                              setShowQualityMenu(false);
-                            }}
-                            className={cn(
-                              "w-full text-left px-3 py-1.5 text-xs font-semibold rounded-lg transition-all flex items-center justify-between",
-                              currentResolution === (item.res || item) ? 'bg-white text-black font-bold' : 'text-neutral-300 hover:bg-white/10'
-                            )}
-                          >
-                            <span>{resLabel}</span>
-                            {currentResolution === (item.res || item) && <Check size={13} />}
-                          </button>
-                        );
-                      })}
+                      {video?.status === 'live' ? (
+                        <div className="px-3 py-2 text-xs text-neutral-300 flex items-center gap-2">
+                          <span className="w-2 h-2 rounded-full bg-rose-500 animate-pulse shrink-0" />
+                          <span>HLS Otomatis (Adaptif)</span>
+                        </div>
+                      ) : (
+                        resolutions.map((item: any) => {
+                          const resLabel = String(item.res || item).endsWith('p') ? (item.res || item) : `${item.res || item}p`;
+                          return (
+                            <button 
+                              key={item.res || item}
+                              onClick={() => {
+                                setCurrentResolution(item.res || item);
+                                setShowQualityMenu(false);
+                              }}
+                              className={cn(
+                                "w-full text-left px-3 py-1.5 text-xs font-semibold rounded-lg transition-all flex items-center justify-between",
+                                currentResolution === (item.res || item) ? 'bg-white text-black font-bold' : 'text-neutral-300 hover:bg-white/10'
+                              )}
+                            >
+                              <span>{resLabel}</span>
+                              {currentResolution === (item.res || item) && <Check size={13} />}
+                            </button>
+                          );
+                        })
+                      )}
                     </motion.div>
                   )}
                 </AnimatePresence>
@@ -578,24 +600,33 @@ export default function VideoDetailPage() {
               </button>
 
               {/* Download Menu Pill dengan Z-Index Tinggi & Latar Solid */}
-              <div className="relative menu-container shrink-0 z-50">
-                <button 
-                  type="button"
-                  onClick={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    setShowDownloadMenu((prev) => !prev);
-                  }}
-                  className={cn(
-                    "flex items-center gap-2 px-4 py-2 rounded-full text-xs md:text-sm font-semibold text-white transition-all border border-white/5",
-                    showDownloadMenu ? "bg-white/20 text-white" : "bg-white/10 hover:bg-white/15"
-                  )}
+              {video?.status === 'live' ? (
+                <div 
+                  title="Unduhan video akan tersedia setelah siaran live selesai dan di-encode ke multi-resolusi"
+                  className="flex items-center gap-2 px-4 py-2 rounded-full text-xs md:text-sm font-semibold text-neutral-500 bg-white/5 border border-white/5 cursor-not-allowed shrink-0"
                 >
                   <Download size={16} />
-                  <span>Unduh</span>
-                  <ChevronDown size={14} className={cn("transition-transform duration-200", showDownloadMenu ? "rotate-180" : "")} />
-                </button>
-                <AnimatePresence>
+                  <span>Sedang Live</span>
+                </div>
+              ) : (
+                <div className="relative menu-container shrink-0 z-50">
+                  <button 
+                    type="button"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setShowDownloadMenu((prev) => !prev);
+                    }}
+                    className={cn(
+                      "flex items-center gap-2 px-4 py-2 rounded-full text-xs md:text-sm font-semibold text-white transition-all border border-white/5",
+                      showDownloadMenu ? "bg-white/20 text-white" : "bg-white/10 hover:bg-white/15"
+                    )}
+                  >
+                    <Download size={16} />
+                    <span>Unduh</span>
+                    <ChevronDown size={14} className={cn("transition-transform duration-200", showDownloadMenu ? "rotate-180" : "")} />
+                  </button>
+                  <AnimatePresence>
                   {showDownloadMenu && (
                     <motion.div 
                       initial={{ opacity: 0, y: 10, scale: 0.95 }}
@@ -656,6 +687,7 @@ export default function VideoDetailPage() {
                   )}
                 </AnimatePresence>
               </div>
+              )}
 
               {/* Weekly Report Button Pill */}
               <button 

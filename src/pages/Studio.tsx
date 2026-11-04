@@ -26,6 +26,8 @@ import {
   CheckCircle, 
   XCircle, 
   AlertCircle, 
+  AlertTriangle,
+  StopCircle,
   Save, 
   X,
   Upload as UploadIcon,
@@ -51,6 +53,15 @@ export default function StudioPage() {
   const [isSaving, setIsSaving] = useState(false);
   const [deleteId, setDeleteId] = useState<number | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [isBulkDeleteOpen, setIsBulkDeleteOpen] = useState(false);
+  const [abortModal, setAbortModal] = useState<{
+    isOpen: boolean;
+    type: 'all' | 'single';
+    taskId?: string;
+    taskTitle?: string;
+    taskStatus?: string;
+  } | null>(null);
+  const [isAborting, setIsAborting] = useState(false);
   const [imgErrors, setImgErrors] = useState<{ [key: string]: boolean }>({});
 
   // Toggle Centang Satuan
@@ -69,14 +80,14 @@ export default function StudioPage() {
     }
   };
 
-  // Handler Hapus Massal (Bulk Delete)
-  const handleBulkDelete = async () => {
+  // Handler Hapus Massal (Buka Custom Modal)
+  const handleBulkDelete = () => {
     if (selectedIds.length === 0) return;
-    
-    if (!window.confirm(`Apakah Anda yakin ingin menghapus ${selectedIds.length} video yang dipilih? Tindakan ini tidak dapat dibatalkan.`)) {
-      return;
-    }
+    setIsBulkDeleteOpen(true);
+  };
 
+  const executeBulkDelete = async () => {
+    if (selectedIds.length === 0) return;
     setIsDeleting(true);
     try {
       const res = await fetch('/api/videos/bulk-delete', {
@@ -90,9 +101,10 @@ export default function StudioPage() {
 
       if (res.ok) {
         setSelectedIds([]);
+        setIsBulkDeleteOpen(false);
         if (typeof fetchVideos === 'function') fetchVideos();
       } else {
-        alert("Gagal menghapus beberapa video.");
+        setError("Gagal menghapus beberapa video.");
       }
     } catch (err) {
       console.error("Bulk Delete Exception:", err);
@@ -289,52 +301,75 @@ export default function StudioPage() {
     }
   };
 
-  // Fungsi Hentikan Paksa Satu Tugas (Tahap 53)
-  const handleAbortTask = async (taskId: string) => {
-    if (!window.confirm("Apakah Anda yakin ingin menghentikan paksa proses ini?")) return;
-
-    try {
-      await fetch('/api/video/abort-processing', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ uploadId: taskId })
-      });
-
-      // Hapus dari localStorage
-      const rawTasks = localStorage.getItem('active_upload_tasks');
-      if (rawTasks) {
-        const tasks = JSON.parse(rawTasks);
-        const updated = tasks.filter((t: any) => t.id !== taskId);
-        localStorage.setItem('active_upload_tasks', JSON.stringify(updated));
-      }
-
-      if (typeof fetchVideos === 'function') fetchVideos();
-    } catch (err) {
-      console.error("Gagal hentikan paksa task:", err);
-    }
+  // Buka Modal Hentikan Paksa Satu Tugas (Substitusi Modern window.confirm)
+  const handleAbortTask = (taskId: string, title?: string, status?: string) => {
+    setAbortModal({
+      isOpen: true,
+      type: 'single',
+      taskId,
+      taskTitle: title || 'Video',
+      taskStatus: status
+    });
   };
 
-  // Fungsi Hentikan Paksa Semua Tugas (Tahap 53)
-  const handleAbortAll = async () => {
-    if (!window.confirm("⚠️ PERINGATAN: Hentikan PAKSA seluruh proses upload & encoding yang sedang berjalan?")) return;
+  // Buka Modal Hentikan Paksa Semua Tugas (Substitusi Modern window.confirm)
+  const handleAbortAll = () => {
+    setAbortModal({
+      isOpen: true,
+      type: 'all'
+    });
+  };
 
-    const rawTasks = localStorage.getItem('active_upload_tasks');
-    if (!rawTasks) return;
+  // Eksekusi Hentikan Paksa setelah Pengguna Konfirmasi di Custom Modal
+  const executeAbort = async () => {
+    if (!abortModal) return;
+    setIsAborting(true);
 
-    const tasks = JSON.parse(rawTasks);
-    for (const task of tasks) {
-      try {
+    try {
+      if (abortModal.type === 'single' && abortModal.taskId) {
         await fetch('/api/video/abort-processing', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ uploadId: task.id })
+          body: JSON.stringify({ uploadId: abortModal.taskId })
         });
-      } catch (e) {}
-    }
 
-    localStorage.removeItem('active_upload_tasks');
-    if (typeof fetchVideos === 'function') fetchVideos();
-    window.location.reload();
+        // Hapus dari localStorage & React State
+        const rawTasks = localStorage.getItem('active_upload_tasks');
+        if (rawTasks) {
+          const tasks = JSON.parse(rawTasks);
+          const updated = tasks.filter((t: any) => t.id !== abortModal.taskId);
+          localStorage.setItem('active_upload_tasks', JSON.stringify(updated));
+          setActiveTasks(updated);
+        } else {
+          setActiveTasks(prev => prev.filter(t => t.id !== abortModal.taskId));
+        }
+
+        if (typeof fetchVideos === 'function') fetchVideos();
+      } else if (abortModal.type === 'all') {
+        const rawTasks = localStorage.getItem('active_upload_tasks');
+        if (rawTasks) {
+          const tasks = JSON.parse(rawTasks);
+          for (const task of tasks) {
+            try {
+              await fetch('/api/video/abort-processing', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ uploadId: task.id })
+              });
+            } catch (e) {}
+          }
+        }
+
+        localStorage.removeItem('active_upload_tasks');
+        setActiveTasks([]);
+        if (typeof fetchVideos === 'function') fetchVideos();
+      }
+    } catch (err) {
+      console.error("Gagal menghentikan paksa task:", err);
+    } finally {
+      setIsAborting(false);
+      setAbortModal(null);
+    }
   };
 
   const handleEdit = (video: any) => {
@@ -651,11 +686,17 @@ export default function StudioPage() {
                            task.status}
                         </span>
                         <button 
-                          onClick={() => handleAbortTask(task.id)}
+                          onClick={() => handleAbortTask(task.id, task.title, 
+                            task.status === 'queued' ? 'Antre Upload' :
+                            task.status === 'uploading' ? 'Sedang Mengunggah Chunks' :
+                            task.status === 'merging' ? 'Menyatukan Chunks' :
+                            task.status === 'waiting' ? 'Antre Encoding GPU' :
+                            task.status === 'processing' ? 'Encoding GPU (NVENC)' : task.status
+                          )}
                           title="Hentikan Paksa Proses Ini"
-                          className="text-xs text-red-400 hover:text-red-300 bg-neutral-900 hover:bg-red-950/50 p-1.5 rounded-lg border border-neutral-800 hover:border-red-500/40 transition-all"
+                          className="text-xs text-red-400 hover:text-red-300 bg-neutral-900 hover:bg-red-950/50 p-1.5 rounded-lg border border-neutral-800 hover:border-red-500/40 transition-all active:scale-95 flex items-center gap-1"
                         >
-                          🛑
+                          <StopCircle className="w-4 h-4 text-red-500" />
                         </button>
                       </div>
                     </div>
@@ -1083,6 +1124,205 @@ export default function StudioPage() {
                   className="w-full py-4 rounded-2xl font-black text-xs uppercase tracking-widest text-neutral-500 hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors active:scale-95"
                 >
                   Keep Video
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Abort Process Confirmation Modal (Substitusi Modern window.confirm) */}
+      <AnimatePresence>
+        {abortModal?.isOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            {/* Backdrop Blur */}
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => !isAborting && setAbortModal(null)}
+              className="absolute inset-0 bg-black/75 backdrop-blur-md"
+            />
+
+            {/* Modal Dialog Content */}
+            <motion.div 
+              initial={{ scale: 0.92, opacity: 0, y: 15 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.92, opacity: 0, y: 15 }}
+              transition={{ type: 'spring', damping: 25, stiffness: 350 }}
+              className="relative bg-neutral-900 border border-red-500/30 rounded-3xl p-6 sm:p-8 max-w-lg w-full shadow-2xl shadow-red-950/50 z-10 overflow-hidden text-neutral-100"
+            >
+              {/* Top Accent Gradient Border */}
+              <div className="absolute top-0 left-0 right-0 h-1.5 bg-gradient-to-r from-red-600 via-amber-500 to-rose-600" />
+
+              {/* Close Button */}
+              <button 
+                onClick={() => !isAborting && setAbortModal(null)}
+                className="absolute top-5 right-5 text-neutral-400 hover:text-white p-2 rounded-xl hover:bg-neutral-800 transition-colors"
+                disabled={isAborting}
+              >
+                <X className="w-5 h-5" />
+              </button>
+
+              {/* Header Icon & Badges */}
+              <div className="flex items-start gap-4 mb-5">
+                <div className="w-14 h-14 rounded-2xl bg-red-500/10 border border-red-500/30 flex items-center justify-center flex-shrink-0 text-red-500 shadow-inner">
+                  <StopCircle className="w-7 h-7 animate-pulse" />
+                </div>
+                <div>
+                  <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-black tracking-wider uppercase bg-red-500/20 text-red-400 border border-red-500/30 mb-1.5">
+                    <AlertTriangle className="w-3.5 h-3.5" /> Konfirmasi Tindakan Kritis
+                  </div>
+                  <h3 className="text-xl sm:text-2xl font-black text-white font-display">
+                    {abortModal.type === 'all' 
+                      ? 'Hentikan Semua Proses?' 
+                      : 'Hentikan Proses Video Ini?'}
+                  </h3>
+                </div>
+              </div>
+
+              {/* Target Context Summary Card */}
+              <div className="bg-neutral-950/80 border border-neutral-800 rounded-2xl p-4 mb-5">
+                {abortModal.type === 'all' ? (
+                  <div className="space-y-2">
+                    <div className="flex justify-between items-center text-xs">
+                      <span className="text-neutral-400">Total Tugas Sedang Berjalan:</span>
+                      <span className="font-bold text-white bg-red-950/60 border border-red-800/50 px-2.5 py-0.5 rounded-md text-red-300">
+                        {activeTasks.filter((t: any) => t.status !== 'ready').length} Video
+                      </span>
+                    </div>
+                    <p className="text-xs text-neutral-300 leading-relaxed">
+                      Anda akan menghentikan seluruh antrean upload chunk, penggabungan file, dan encoding GPU NVENC yang sedang berlangsung di server.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    <div className="text-xs text-neutral-400">Judul Video:</div>
+                    <div className="text-sm font-bold text-white truncate bg-neutral-900 px-3 py-2 rounded-xl border border-neutral-800">
+                      {abortModal.taskTitle || 'Video yang sedang diproses'}
+                    </div>
+                    {abortModal.taskStatus && (
+                      <div className="flex items-center gap-2 pt-1">
+                        <span className="text-[11px] text-neutral-400">Tahap Saat Ini:</span>
+                        <span className="text-[11px] font-bold text-amber-400 bg-amber-500/10 border border-amber-500/20 px-2.5 py-0.5 rounded-full">
+                          {abortModal.taskStatus}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Informative Consequence Bullet Points */}
+              <div className="space-y-2.5 mb-6 text-xs text-neutral-300">
+                <div className="flex items-start gap-2.5 bg-neutral-950/40 p-2.5 rounded-xl border border-neutral-800/60">
+                  <span className="text-base leading-none mt-0.5">⚡</span>
+                  <div>
+                    <strong className="text-white block">Proses FFmpeg & GPU Dihentikan:</strong>
+                    Aktivitas encoding hardware NVENC di server akan langsung dimatikan seketika untuk membebaskan alokasi VRAM.
+                  </div>
+                </div>
+                <div className="flex items-start gap-2.5 bg-neutral-950/40 p-2.5 rounded-xl border border-neutral-800/60">
+                  <span className="text-base leading-none mt-0.5">🗑️</span>
+                  <div>
+                    <strong className="text-white block">Pembersihan File Sementara:</strong>
+                    Seluruh potongan (*chunks*) dan file parsial yang belum selesai dienkode akan dibersihkan dari storage server.
+                  </div>
+                </div>
+                <div className="flex items-start gap-2.5 bg-neutral-950/40 p-2.5 rounded-xl border border-neutral-800/60">
+                  <span className="text-base leading-none mt-0.5">ℹ️</span>
+                  <div>
+                    <strong className="text-white block">Dapat Diunggah Kembali:</strong>
+                    Status akan dibatalkan dengan aman dan Anda dapat mengunggah kembali file tersebut kapan saja.
+                  </div>
+                </div>
+              </div>
+
+              {/* Action Buttons */}
+              <div className="flex flex-col-reverse sm:flex-row items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => setAbortModal(null)}
+                  disabled={isAborting}
+                  className="w-full sm:w-1/2 py-3.5 px-4 rounded-xl text-xs font-bold text-neutral-300 bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 transition-all active:scale-95 disabled:opacity-50"
+                >
+                  Batal, Lanjutkan Proses
+                </button>
+                <button
+                  type="button"
+                  onClick={executeAbort}
+                  disabled={isAborting}
+                  className="w-full sm:w-1/2 py-3.5 px-4 rounded-xl text-xs font-bold text-white bg-gradient-to-r from-red-600 via-rose-600 to-red-700 hover:from-red-500 hover:to-rose-600 shadow-xl shadow-red-600/30 transition-all active:scale-95 flex items-center justify-center gap-2 disabled:opacity-50"
+                >
+                  {isAborting ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <span>Menghentikan...</span>
+                    </>
+                  ) : (
+                    <>
+                      <StopCircle className="w-4 h-4" />
+                      <span>Ya, Hentikan Paksa</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Bulk Delete Confirmation Modal (Substitusi Modern window.confirm) */}
+      <AnimatePresence>
+        {isBulkDeleteOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => !isDeleting && setIsBulkDeleteOpen(false)}
+              className="absolute inset-0 bg-black/75 backdrop-blur-md"
+            />
+            <motion.div 
+              initial={{ scale: 0.92, opacity: 0, y: 15 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.92, opacity: 0, y: 15 }}
+              className="relative bg-neutral-900 border border-red-500/30 rounded-3xl p-6 sm:p-8 max-w-md w-full shadow-2xl z-10 text-neutral-100 overflow-hidden"
+            >
+              <div className="absolute top-0 left-0 right-0 h-1.5 bg-gradient-to-r from-red-600 to-rose-600" />
+              <button 
+                onClick={() => !isDeleting && setIsBulkDeleteOpen(false)}
+                className="absolute top-5 right-5 text-neutral-400 hover:text-white p-2 rounded-xl hover:bg-neutral-800 transition-colors"
+                disabled={isDeleting}
+              >
+                <X className="w-5 h-5" />
+              </button>
+
+              <div className="w-16 h-16 bg-red-500/10 border border-red-500/30 text-red-500 rounded-2xl flex items-center justify-center mx-auto mb-4 shadow-inner">
+                <Trash2 className="w-8 h-8" />
+              </div>
+              
+              <h2 className="text-2xl font-black text-center mb-2 text-white font-display">
+                Hapus {selectedIds.length} Video Terpilih?
+              </h2>
+              <p className="text-neutral-400 text-xs text-center mb-6 leading-relaxed">
+                Tindakan ini bersifat permanen. Seluruh file video, resolusi, thumbnail, data analitik, dan riwayat interaksi akan dihapus selamanya dari server.
+              </p>
+
+              <div className="flex flex-col gap-2.5">
+                <button 
+                  onClick={executeBulkDelete}
+                  disabled={isDeleting}
+                  className="w-full bg-red-600 hover:bg-red-700 text-white py-3.5 rounded-xl font-bold text-xs uppercase tracking-wider transition-all shadow-lg shadow-red-600/30 flex items-center justify-center gap-2 disabled:opacity-50 active:scale-95"
+                >
+                  {isDeleting ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Ya, Hapus Semua yang Dipilih'}
+                </button>
+                <button 
+                  onClick={() => setIsBulkDeleteOpen(false)}
+                  disabled={isDeleting}
+                  className="w-full py-3 rounded-xl font-bold text-xs text-neutral-400 hover:text-white hover:bg-neutral-800 transition-colors active:scale-95"
+                >
+                  Batal
                 </button>
               </div>
             </motion.div>

@@ -37,6 +37,11 @@ import { initDashboard, logBox } from './lib/dashboard';
 let isStreamActive = false;
 let currentStreamKey = '';
 let currentLiveVideoId: number | null = null;
+let currentLiveConfig = {
+  title: 'Live Stream Siaran Langsung',
+  description: 'Siaran langsung dari OmniHub Live Studio',
+  userId: 1
+};
 
 // --- PEMBAJAKAN CONSOLE LOG UNTUK DASHBOARD (STAGE 1.13 SILENT STDOUT) ---
 const originalLog = console.log;
@@ -938,7 +943,7 @@ Aturan Penulisan:
 // ============================================================================
 // 5. MULTI-RESOLUTION FFMPEG GPU CUDA (RTX 3050 HARDWARE PIPELINE)
 // ============================================================================
-function processVideo(videoId: number, inputPath: string, originalFilename: string, uploadId?: string): Promise<void> {
+function processVideo(videoId: number, inputPath: string, originalFilename: string, uploadId?: string, isObfuscated: boolean = true): Promise<void> {
   return new Promise(async (resolveQueue, rejectQueue) => {
     const startTime = Date.now();
     let activeInputPath = inputPath;
@@ -948,10 +953,12 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
       console.log(`[SYSTEM] Starting FFmpeg NVENC Multi-Resolution Pipeline for VideoID: ${videoId}`);
 
       // De-obfuscate in-place directly on source file without disk duplication (Stage 1.3)
-      if (fs.existsSync(inputPath)) {
-        obfuscateFileInPlace(inputPath);
-      } else {
-        throw new Error('Input obfuscated file not found');
+      if (isObfuscated) {
+        if (fs.existsSync(inputPath)) {
+          obfuscateFileInPlace(inputPath);
+        } else {
+          throw new Error('Input obfuscated file not found');
+        }
       }
 
       // Probe exact video duration using ffprobe
@@ -1020,12 +1027,20 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
       
       let sourceHeight = 0;
       let sourceWidth = 0;
+      let sourcePixFmt = '';
+      let isSourceHardwareDecodeIncompatible = false;
       if (metadataStr && metadataStr.streams) {
         const videoStream = metadataStr.streams.find((s: any) => s.codec_type === 'video');
         if (videoStream) {
           sourceHeight = videoStream.height || 0;
           sourceWidth = videoStream.width || 0;
-          console.log(`[SYSTEM] Detected source video resolution: ${sourceWidth}x${sourceHeight}`);
+          sourcePixFmt = (videoStream.pix_fmt || '').toLowerCase();
+          console.log(`[SYSTEM] Detected source video resolution: ${sourceWidth}x${sourceHeight}, pix_fmt: ${sourcePixFmt}`);
+          // GeForce RTX NVDEC lacks hardware decoding for H.264 4:4:4 (common in Zoom/screen captures) or RGB surfaces
+          if (sourcePixFmt.includes('444') || sourcePixFmt.includes('rgb') || sourcePixFmt.includes('bgr')) {
+            isSourceHardwareDecodeIncompatible = true;
+            console.log(`[SYSTEM] Input video pixel format (${sourcePixFmt}) requires software decoding fallback.`);
+          }
         }
       }
 
@@ -1123,96 +1138,206 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
           ];
         };
 
-        const attachFFmpegProgressListeners = (proc: any, uploadIdStr: string) => {
-          let fileTotalDuration = 0;
-          let lastProgressEmit = 0;
-          let lastEmitTimestamp = 0;
-          let remainder = '';
+        // --- TIER 2: ROBUST NVENC GPU ENGINE (SOFTWARE DECODE + NVENC HARDWARE ENCODE) ---
+        // Penyelamat untuk Zoom, WebRTC, High 4:4:4, variable framerate, atau resolusi non-standar
+        const buildRobustNVENCArgs = (inputPath: string, outputPath: string, targetResName: string, srcW: number, srcH: number) => {
+          const profile = RESOLUTION_PROFILES[targetResName] || RESOLUTION_PROFILES['720p'];
+          const isVertical = srcH > srcW;
+          const scaleFilter = isVertical 
+            ? `scale=-2:${profile.height}:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p` 
+            : `scale=${profile.width}:-2:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p`;
 
-          proc.stdout.on('data', (chunk: any) => {
-            remainder += chunk.toString();
-            const lines = remainder.split('\n');
-            remainder = lines.pop() || '';
-            
-            for (const line of lines) {
-              const [key, value] = line.trim().split('=');
-              // --- STRICT 99% CAP FFMPEG PARSER + THROTTLED SOCKET EMISSION (STAGE 1.2) ---
-              if (key === 'out_time_ms') {
-                const microseconds = parseInt(value, 10);
-                if (!isNaN(microseconds) && fileTotalDuration > 0) {
-                  const currentSeconds = microseconds / 1000000;
-                  const calculatedPercent = Math.min(99, Math.max(1, Math.floor((currentSeconds / fileTotalDuration) * 100)));
-                  
-                  const passProgress = (calculatedPercent * weightInfo.weight) / 100;
-                  const totalProgress = Math.min(99, Math.floor(weightInfo.base + passProgress));
-                  
-                  if (uploadIdStr) {
+          return [
+            '-progress', 'pipe:1',
+            '-nostats',
+            '-fflags', '+genpts+discardcorrupt',
+            '-avoid_negative_ts', 'make_zero',
+            '-analyzeduration', '100M',
+            '-probesize', '100M',
+            '-i', inputPath,
+            '-vf', scaleFilter,
+            '-c:v', 'h264_nvenc',
+            '-preset', 'p4',
+            '-rc', 'vbr',
+            '-cq', profile.cq.toString(),
+            '-b:v', profile.bitrate,
+            '-maxrate', profile.maxrate,
+            '-bufsize', profile.bufsize,
+            '-spatial_aq', '1',
+            '-temporal_aq', '1',
+            '-c:a', 'aac',
+            '-b:a', profile.height <= 480 ? '96k' : '128k',
+            '-ac', '2',
+            '-y', outputPath
+          ];
+        };
+
+        // --- TIER 3: UNIVERSAL CPU SOFTWARE FALLBACK ENGINE (libx264) ---
+        // Jaring pengaman mutlak jika GPU NVENC mengalami kendala driver/session limit
+        const buildCPUFallbackArgs = (inputPath: string, outputPath: string, targetResName: string, srcW: number, srcH: number) => {
+          const profile = RESOLUTION_PROFILES[targetResName] || RESOLUTION_PROFILES['720p'];
+          const isVertical = srcH > srcW;
+          const scaleFilter = isVertical 
+            ? `scale=-2:${profile.height}:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p` 
+            : `scale=${profile.width}:-2:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p`;
+
+          return [
+            '-progress', 'pipe:1',
+            '-nostats',
+            '-fflags', '+genpts+discardcorrupt',
+            '-avoid_negative_ts', 'make_zero',
+            '-analyzeduration', '100M',
+            '-probesize', '100M',
+            '-i', inputPath,
+            '-vf', scaleFilter,
+            '-c:v', 'libx264',
+            '-preset', 'veryfast',
+            '-crf', '23',
+            '-c:a', 'aac',
+            '-b:a', profile.height <= 480 ? '96k' : '128k',
+            '-ac', '2',
+            '-y', outputPath
+          ];
+        };
+
+        const runFFmpegCommand = (engineName: string, args: string[], uploadIdStr: string): Promise<void> => {
+          return new Promise<void>((resolve, reject) => {
+            const stderrBuffer: string[] = [];
+            const ffmpegProc = spawn('ffmpeg', args);
+
+            if (uploadIdStr) activeFFmpegProcesses.set(uploadIdStr, ffmpegProc);
+
+            let fileTotalDuration = detectedVideoDuration || 0;
+            let lastProgressEmit = 0;
+            let lastEmitTimestamp = 0;
+            let remainder = '';
+
+            ffmpegProc.stdout.on('data', (chunk: any) => {
+              remainder += chunk.toString();
+              const lines = remainder.split('\n');
+              remainder = lines.pop() || '';
+              
+              for (const line of lines) {
+                const [key, value] = line.trim().split('=');
+                // --- STRICT 99% CAP FFMPEG PARSER + THROTTLED SOCKET EMISSION (STAGE 1.2) ---
+                if (key === 'out_time_ms') {
+                  const microseconds = parseInt(value, 10);
+                  if (!isNaN(microseconds) && fileTotalDuration > 0) {
+                    const currentSeconds = microseconds / 1000000;
+                    const calculatedPercent = Math.min(99, Math.max(1, Math.floor((currentSeconds / fileTotalDuration) * 100)));
+                    
+                    const passProgress = (calculatedPercent * weightInfo.weight) / 100;
+                    const totalProgress = Math.min(99, Math.floor(weightInfo.base + passProgress));
+                    
+                    if (uploadIdStr) {
                       encodingProgressMap.set(uploadIdStr, totalProgress);
-                  }
+                    }
 
-                  const now = Date.now();
-                  // Throttling: Emit hanya jika progress naik DAN (selisih >= 300ms ATAU mencapai batas 99%)
-                  if (totalProgress > lastProgressEmit && (now - lastEmitTimestamp >= 300 || totalProgress === 99)) {
-                    lastProgressEmit = totalProgress;
-                    lastEmitTimestamp = now;
-                    io.emit('video-progress-' + videoId, { 
-                      status: 'processing', 
-                      progress: totalProgress,
-                      encodingProgress: totalProgress,
-                      resolution: `${passName} (${resolutions.map(r => r[0]).join(', ')})`,
-                      engine: 'NVENC Hybrid Two-Pass'
-                    });
+                    const now = Date.now();
+                    // Throttling: Emit hanya jika progress naik DAN (selisih >= 300ms ATAU mencapai batas 99%)
+                    if (totalProgress > lastProgressEmit && (now - lastEmitTimestamp >= 300 || totalProgress === 99)) {
+                      lastProgressEmit = totalProgress;
+                      lastEmitTimestamp = now;
+                      io.emit('video-progress-' + videoId, { 
+                        status: 'processing', 
+                        progress: totalProgress,
+                        encodingProgress: totalProgress,
+                        resolution: `${passName} (${resolutions.map(r => r[0]).join(', ')})`,
+                        engine: `NVENC (${engineName})`
+                      });
+                    }
                   }
                 }
               }
-            }
-          });
+            });
 
-          proc.stderr.on('data', (chunk: any) => {
-            const logStr = chunk.toString();
-            if (!fileTotalDuration) {
-              const durationMatch = logStr.match(/Duration:\s*(\d+):(\d+):(\d+\.\d+)/) || logStr.match(/Duration:\s*(\d+):(\d+):(\d+)/);
-              if (durationMatch) {
-                const h = parseFloat(durationMatch[1]);
-                const m = parseFloat(durationMatch[2]);
-                const s = parseFloat(durationMatch[3]);
-                fileTotalDuration = h * 3600 + m * 60 + s;
-                console.log(`[FFMPEG PROBE] Durasi Total Video Detected: ${fileTotalDuration} Detik (ID: ${uploadIdStr})`);
+            ffmpegProc.stderr.on('data', (chunk: any) => {
+              const logStr = chunk.toString();
+              const lines = logStr.split('\n');
+              for (const l of lines) {
+                const trimmed = l.trim();
+                if (trimmed) {
+                  stderrBuffer.push(trimmed);
+                  if (stderrBuffer.length > 25) stderrBuffer.shift();
+                }
               }
-            }
-          });
-        };
-
-        // --- PURE CUDA VRAM EXECUTION ENGINE (TAHAP 54.4) ---
-        const executePureGPUVRAMTranscoding = async (uploadIdStr: string, inputPath: string, outputPath: string, targetResName: string) => {
-          return new Promise<void>((resolve, reject) => {
-            console.log(`[PURE GPU VRAM 54.4] Memulai 100% Pure CUDA VRAM Transcoding untuk ID: ${uploadIdStr} (Res: ${targetResName})...`);
-            
-            const args = buildPureGPUVRAMArgs(inputPath, outputPath, targetResName, sourceWidth, sourceHeight);
-            const ffmpegProc = spawn('ffmpeg', args);
-
-            // Mendaftarkan instance untuk Force Stop / Abort Engine
-            if (uploadIdStr) activeFFmpegProcesses.set(uploadIdStr, ffmpegProc);
-            attachFFmpegProgressListeners(ffmpegProc, uploadIdStr);
+              if (!fileTotalDuration) {
+                const durationMatch = logStr.match(/Duration:\s*(\d+):(\d+):(\d+\.\d+)/) || logStr.match(/Duration:\s*(\d+):(\d+):(\d+)/);
+                if (durationMatch) {
+                  const h = parseFloat(durationMatch[1]);
+                  const m = parseFloat(durationMatch[2]);
+                  const s = parseFloat(durationMatch[3]);
+                  fileTotalDuration = h * 3600 + m * 60 + s;
+                  console.log(`[FFMPEG PROBE] Durasi Total Video Detected: ${fileTotalDuration} Detik (ID: ${uploadIdStr})`);
+                }
+              }
+            });
 
             ffmpegProc.on('close', async (code) => {
               if (uploadIdStr) activeFFmpegProcesses.delete(uploadIdStr);
               
               if (code === 0) {
-                console.log(`[PURE GPU VRAM 54.4] Sub-pass resolution ${targetResName} completed for ID: ${uploadIdStr}`);
                 resolve();
               } else {
-                console.error(`[PURE GPU VRAM 54.4] ERROR: GPU Processing exited with code ${code}.`);
-                reject(new Error(`Pure GPU Transcoding failed with exit code ${code}`));
+                const recentStderr = stderrBuffer.slice(-5).join(' | ');
+                const error = new Error(`${engineName} exited with code ${code}. Stderr: ${recentStderr}`);
+                (error as any).code = code;
+                (error as any).wasKilled = ffmpegProc.killed;
+                reject(error);
               }
             });
 
             ffmpegProc.on('error', (err) => {
               if (uploadIdStr) activeFFmpegProcesses.delete(uploadIdStr);
-              console.error(`[PURE GPU VRAM 54.4] PROCESS ERROR:`, err);
+              (err as any).wasKilled = ffmpegProc.killed;
               reject(err);
             });
           });
+        };
+
+        // --- MULTI-TIER TRANSCODING ENGINE DENGAN AUTOMATIC FALLBACK ---
+        const executeTranscodingWithFallback = async (uploadIdStr: string, inputPath: string, outputPath: string, targetResName: string) => {
+          const cleanOutput = () => {
+            try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch (e) { /* ignore */ }
+          };
+
+          // 1. Coba Tier 1: Pure CUDA VRAM Transcoding jika input kompatibel dengan hardware decoding NVDEC
+          if (!isSourceHardwareDecodeIncompatible) {
+            try {
+              console.log(`[PURE GPU VRAM 54.4] Memulai 100% Pure CUDA VRAM Transcoding untuk ID: ${uploadIdStr} (Res: ${targetResName})...`);
+              const tier1Args = buildPureGPUVRAMArgs(inputPath, outputPath, targetResName, sourceWidth, sourceHeight);
+              await runFFmpegCommand('Pure CUDA VRAM', tier1Args, uploadIdStr);
+              console.log(`[PURE GPU VRAM 54.4] Sub-pass resolution ${targetResName} completed for ID: ${uploadIdStr}`);
+              return;
+            } catch (tier1Err: any) {
+              if (tier1Err.wasKilled) throw tier1Err;
+              console.warn(`[PURE GPU VRAM 54.4 WARNING] Pure CUDA VRAM gagal untuk ${targetResName} (Exit Code: ${tier1Err.code}). Beralih otomatis ke Robust NVENC Fallback...`);
+              // Tandai agar subpass berikutnya langsung menggunakan Tier 2 tanpa membuang waktu
+              isSourceHardwareDecodeIncompatible = true;
+              cleanOutput();
+            }
+          }
+
+          // 2. Coba Tier 2: Robust NVENC GPU Pipeline (Software Decode + GPU NVENC Encoding)
+          // 100% kompatibel dengan Zoom recordings, WebRTC, High 4:4:4, odd resolutions, dll.
+          try {
+            console.log(`[ROBUST GPU NVENC] Memulai Transcoding Robust NVENC untuk ID: ${uploadIdStr} (Res: ${targetResName})...`);
+            const tier2Args = buildRobustNVENCArgs(inputPath, outputPath, targetResName, sourceWidth, sourceHeight);
+            await runFFmpegCommand('Robust NVENC GPU', tier2Args, uploadIdStr);
+            console.log(`[ROBUST GPU NVENC] Sub-pass resolution ${targetResName} completed for ID: ${uploadIdStr}`);
+            return;
+          } catch (tier2Err: any) {
+            if (tier2Err.wasKilled) throw tier2Err;
+            console.warn(`[ROBUST GPU NVENC WARNING] Robust NVENC gagal untuk ${targetResName} (Exit Code: ${tier2Err.code}). Beralih ke Universal CPU Fallback...`);
+            cleanOutput();
+          }
+
+          // 3. Coba Tier 3: Universal Software Fallback (CPU libx264)
+          // Jaring pengaman mutlak jika GPU NVENC mengalami masalah driver atau session limit
+          console.log(`[CPU FALLBACK] Memulai Universal CPU libx264 Transcoding untuk ID: ${uploadIdStr} (Res: ${targetResName})...`);
+          const tier3Args = buildCPUFallbackArgs(inputPath, outputPath, targetResName, sourceWidth, sourceHeight);
+          await runFFmpegCommand('Universal CPU libx264', tier3Args, uploadIdStr);
+          console.log(`[CPU FALLBACK] Sub-pass resolution ${targetResName} completed for ID: ${uploadIdStr}`);
         };
 
         for (let i = 0; i < resolutions.length; i++) {
@@ -1220,7 +1345,7 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
           const outputPath = path.join(PROCESSED_DIR, `processed-${videoId}-${resKey}.mp4`);
           try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch (e) { /* ignore */ }
           
-          await executePureGPUVRAMTranscoding(uploadId || '', activeInputPath, outputPath, resKey);
+          await executeTranscodingWithFallback(uploadId || '', activeInputPath, outputPath, resKey);
         }
       };
 
@@ -2250,8 +2375,8 @@ app.get('/api/search/suggestions', async (req, res) => {
     // Cari judul video yang cocok, urutkan berdasarkan views/kepopuleran
     const [rows]: any = await db.query(
       `SELECT DISTINCT title FROM Videos 
-       WHERE (title LIKE ? OR description LIKE ?) AND status = 'ready' 
-       ORDER BY views DESC LIMIT 8`,
+       WHERE (title LIKE ? OR description LIKE ?) AND (status = 'ready' OR status = 'live') 
+       ORDER BY (CASE WHEN status = 'live' THEN 0 ELSE 1 END), views DESC LIMIT 8`,
       [`%${query}%`, `%${query}%`]
     );
 
@@ -2270,8 +2395,8 @@ app.get('/api/search', async (req, res) => {
   try {
     const [rows]: any = await db.query(
       `SELECT * FROM Videos 
-       WHERE status = 'ready' AND (title LIKE ? OR description LIKE ?) 
-       ORDER BY created_at DESC`,
+       WHERE (status = 'ready' OR status = 'live') AND (title LIKE ? OR description LIKE ?) 
+       ORDER BY (CASE WHEN status = 'live' THEN 0 ELSE 1 END), created_at DESC`,
       [`%${query}%`, `%${query}%`]
     );
     res.json(rows);
@@ -2285,7 +2410,7 @@ app.get('/api/videos', async (req, res) => {
   console.log('[API CALL] ' + req.originalUrl);
   try {
     const { q, category, sort, limit } = req.query;
-    let query = "SELECT v.*, u.firstName, u.lastName, u.avatar_url FROM Videos v JOIN Users u ON v.user_id = u.id WHERE v.status = 'ready' AND (v.visibility = 'public' OR v.visibility IS NULL)";
+    let query = "SELECT v.*, u.firstName, u.lastName, u.avatar_url FROM Videos v JOIN Users u ON v.user_id = u.id WHERE (v.status = 'ready' OR v.status = 'live') AND (v.visibility = 'public' OR v.visibility IS NULL)";
     const params: any[] = [];
     if (q) {
       query += ' AND (v.title LIKE ? OR v.description LIKE ?)';
@@ -2312,9 +2437,9 @@ app.get('/api/videos', async (req, res) => {
       }
     }
     if (sort === 'trending' || sort === 'views') {
-      query += ' ORDER BY v.views DESC, v.created_at DESC';
+      query += ' ORDER BY (CASE WHEN v.status = "live" THEN 0 ELSE 1 END), v.views DESC, v.created_at DESC';
     } else {
-      query += ' ORDER BY v.created_at DESC';
+      query += ' ORDER BY (CASE WHEN v.status = "live" THEN 0 ELSE 1 END), v.created_at DESC';
     }
     if (limit && !isNaN(Number(limit))) {
       query += ` LIMIT ${parseInt(String(limit), 10)}`;
@@ -2907,8 +3032,8 @@ app.get('/api/channels/:id/videos', async (req, res) => {
       SELECT v.*, u.firstName, u.lastName, u.avatar_url
       FROM Videos v 
       JOIN Users u ON v.user_id = u.id
-      WHERE v.user_id = ? AND v.status = 'ready'
-      ORDER BY v.created_at DESC
+      WHERE v.user_id = ? AND (v.status = 'ready' OR v.status = 'live')
+      ORDER BY (CASE WHEN v.status = 'live' THEN 0 ELSE 1 END), v.created_at DESC
     `, [req.params.id]);
 
     res.json(videos || []);
@@ -4023,16 +4148,48 @@ async function startServer() {
   app.get('/api/videos/:id/download', handleVideoDownload);
 
   // --- API LIVE CREDENTIALS TRACKER (TAHAP 43.3 ZONA PRIORITAS) ---
-  app.get('/api/live/status', (req, res) => {
-      // Menghasilkan IP lokal dinamis dari server
-      const serverIp = '192.168.0.120'; 
-      res.json({
-          isLive: isStreamActive,
-          rtmpUrl: `rtmp://${serverIp}:1935/live`,
-          streamKey: `stream_key_wiji_hub`,
-          title: "Live Stream Wiji Prabowo",
-          viewerCount: isStreamActive ? Math.floor(Math.random() * 5) + 1 : 0
-      });
+  app.get('/api/live/status', async (req: any, res) => {
+    const hostHeader = req.headers.host || '';
+    const hostOnly = hostHeader.split(':')[0] || 'localhost';
+    const serverHost = (hostOnly === '127.0.0.1' || hostOnly === '::1') ? 'localhost' : hostOnly;
+    
+    let currentUserId = currentLiveConfig.userId || 1;
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      try {
+        const decoded: any = jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
+        if (decoded?.id) currentUserId = decoded.id;
+      } catch (e) {}
+    }
+
+    res.json({
+      isLive: isStreamActive,
+      rtmpUrl: `rtmp://${serverHost}:1935/live`,
+      streamKey: currentStreamKey || `stream_key_user_${currentUserId}`,
+      title: currentLiveConfig.title,
+      description: currentLiveConfig.description,
+      videoId: currentLiveVideoId,
+      viewerCount: isStreamActive ? Math.floor(Math.random() * 5) + 1 : 0
+    });
+  });
+
+  // Endpoint untuk memperbarui informasi siaran live (judul, deskripsi)
+  app.post('/api/live/settings', authenticate, async (req: any, res) => {
+    try {
+      const { title, description } = req.body;
+      if (title && typeof title === 'string') currentLiveConfig.title = title.trim();
+      if (description && typeof description === 'string') currentLiveConfig.description = description.trim();
+      currentLiveConfig.userId = req.user.id;
+      
+      // Jika saat ini siaran live sedang berlangsung, perbarui juga data di tabel Videos
+      if (currentLiveVideoId && title) {
+        await db.query("UPDATE Videos SET title = ?, description = ? WHERE id = ?", [title.trim(), description || '', currentLiveVideoId]).catch(() => {});
+      }
+
+      res.json({ success: true, config: currentLiveConfig });
+    } catch (e: any) {
+      res.status(500).json({ error: 'Gagal memperbarui setelan siaran' });
+    }
   });
 
   // --- FUNGSI PEMBERSIN CACHE SIARAN SELESAI (TAHAP 47 - FINAL) ---
@@ -4062,6 +4219,24 @@ async function startServer() {
     res.status(404).json({ error: 'API endpoint not found' });
   });
 
+  // Rute static untuk stream HLS Live (index.m3u8 & .ts segments)
+  const livePublicPath = path.join(__dirname, 'public', 'live');
+  if (!fs.existsSync(livePublicPath)) {
+    fs.mkdirSync(livePublicPath, { recursive: true });
+  }
+  app.use('/live', express.static(livePublicPath, {
+    setHeaders: (res, pathStr) => {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      if (pathStr.endsWith('.m3u8')) {
+        res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+      } else if (pathStr.endsWith('.ts')) {
+        res.setHeader('Content-Type', 'video/mp2t');
+        res.setHeader('Cache-Control', 'public, max-age=3600');
+      }
+    }
+  }));
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -4083,11 +4258,15 @@ async function startServer() {
     });
   });
 
-  // --- GATEWAY RTMP LIVE STREAMING (TAHAP 42) ---
-  // --- MEMBUAT DIREKTORI CACHE LIVE HLS JIKA BELUM ADA ---
+  // --- GATEWAY RTMP LIVE STREAMING & AUTO-ARCHIVE VOD PIPELINE ---
   const liveOutPath = path.join(__dirname, 'public', 'live');
   if (!fs.existsSync(liveOutPath)) {
-      fs.mkdirSync(liveOutPath, { recursive: true });
+    fs.mkdirSync(liveOutPath, { recursive: true });
+  }
+
+  const recordingsPath = path.join(__dirname, 'recordings');
+  if (!fs.existsSync(recordingsPath)) {
+    fs.mkdirSync(recordingsPath, { recursive: true });
   }
 
   const rtmpConfig = {
@@ -4101,26 +4280,29 @@ async function startServer() {
     http: {
       port: 8005, // Port panel internal NMS agar tidak bentrok dengan Express port 3000
       allow_origin: '*',
-      mediaroot: path.join(__dirname, 'public') // Mengarahkan file media ke folder public server
+      mediaroot: path.join(__dirname, 'public')
     },
-    // --- AKTIVASI PIPA TRANSCODING NVIDIA NVENC HLS (TAHAP 44) ---
+    // Auto-Record: Merekam siaran RTMP langsung ke file disk secara real-time
+    record: {
+      path: recordingsPath
+    },
+    // Transcoding HLS Real-Time untuk penonton siaran langsung di web browser
     trans: {
-      ffmpeg: 'ffmpeg', // Memanggil eksekutor universal dari System PATH Windows
+      ffmpeg: 'ffmpeg',
       tasks: [
         {
           app: 'live',
           hls: true,
-          hlsFlags: '[hls_time=2:hls_list_size=4:hls_flags=delete_segments]', // Memotong segmen per 2 detik agar latensi rendah
-          hlsKeep: false, // Menghapus cache segmen lama agar penyimpanan disk Anda tidak meledak
+          hlsFlags: '[hls_time=2:hls_list_size=4:hls_flags=delete_segments]',
+          hlsKeep: false,
           dash: false,
-          // Parameter Akselerasi Perangkat Keras NVENC untuk kestabilan detail video 720p/1080p
           vcParam: [
             '-c:v', 'h264_nvenc',
             '-preset', 'p4',
             '-rc:v', 'vbr',
             '-cq:v', '23',
             '-spatial-aq', '1',
-            '-g', '60' // Keyframe interval yang ideal untuk kestabilan streaming HLS
+            '-g', '60'
           ],
           acParam: [
             '-c:a', 'aac',
@@ -4134,94 +4316,109 @@ async function startServer() {
 
   const nms = new NodeMediaServer(rtmpConfig);
 
-  // Event Tracker: Mendeteksi saat HP atau OBS mulai menembak siaran langsung
-  nms.on('prePublish', (id: string, StreamPath: string, args: any) => {
-  const streamKey = StreamPath.split('/').pop() || 'Unknown';
-  isStreamActive = true;
-  currentStreamKey = streamKey;
-  (global as any).isStreamActive = true;
-  (global as any).currentStreamKey = streamKey;
-  
-  // Pemicu Instan: Jika ada fungsi pembaru UI Terminal, panggil seketika
-  if (typeof (global as any).renderDashboard === 'function') (global as any).renderDashboard();
-  else if (typeof (global as any).drawInterface === 'function') (global as any).drawInterface();
-});
+  // 1. postPublish: Terpicu saat encoder (OBS Studio/Prism) mulai memancarkan siaran
+  nms.on('postPublish', async (session: any) => {
+    try {
+      const streamPath = (typeof session === 'string') ? session : (session?.streamPath || '');
+      const streamKey = (typeof session === 'object' && session?.streamName) ? session.streamName : (streamPath.split('/').pop() || 'stream_key_wiji_hub');
+      
+      console.log(`[LIVE SYSTEM] Stream Terdeteksi Aktif! Key: ${streamKey}, Path: ${streamPath}`);
+      isStreamActive = true;
+      currentStreamKey = streamKey;
+      (global as any).isStreamActive = true;
+      (global as any).currentStreamKey = streamKey;
 
-nms.on('donePublish', (id: string, StreamPath: string, args: any) => {
-  console.log(`[LIVE] Siaran langsung dihentikan. ID: ${id}`);
-  isStreamActive = false;
-  
-  const streamKey = StreamPath.split('/').pop() || 'Unknown';
-  const replayTitle = `Rekaman Siaran Langsung - ${new Date().toLocaleDateString('id-ID')}`;
-  const replayFilename = `live_stream_${streamKey}.mp4`;
+      const hlsPlayUrl = `/live/${streamKey}/index.m3u8`;
+      const liveTitle = currentLiveConfig.title || `Live Stream - ${new Date().toLocaleDateString('id-ID')}`;
+      const liveDesc = currentLiveConfig.description || 'Siaran langsung dari OmniHub Live Studio';
+      
+      let streamUserId = currentLiveConfig.userId || 1;
+      const keyUserMatch = streamKey.match(/stream_key_(?:user_)?(\d+)/);
+      if (keyUserMatch) {
+        streamUserId = parseInt(keyUserMatch[1], 10);
+      }
 
-  // Simpan metadata siaran ke database MySQL sebagai VOD Replay (Tahap 46)
-  const sqlInsertReplay = `
-    INSERT INTO Videos (title, description, url, thumbnail_url, views, status, category) 
-    VALUES (?, ?, ?, ?, 0, 'ready', 'Live Replay')
-  `;
-  const replayUrl = `/live/${streamKey}/index.m3u8`; // Rute pemutaran HLS Replay
-  const defaultThumb = '/thumbnails/default_live.jpg';
+      // Daftarkan siaran ke database dengan status 'live'
+      const sqlInsert = `
+        INSERT INTO Videos (user_id, title, description, url, status, visibility, created_at)
+        VALUES (?, ?, ?, ?, 'live', 'public', NOW())
+      `;
+      const [insertResult]: any = await db.query(sqlInsert, [streamUserId, liveTitle, liveDesc, hlsPlayUrl]);
+      currentLiveVideoId = insertResult.insertId;
+      console.log(`[DATABASE] Live Stream terdaftar di MySQL dengan VideoID: ${currentLiveVideoId}`);
 
-  db.query(sqlInsertReplay, [replayTitle, 'Rekaman otomatis siaran langsung OmniHub', replayUrl, defaultThumb])
-    .then((result: any) => {
-      console.log(`[SUCCESS] Siaran langsung berhasil diarsipkan ke database. Video ID: ${result[0]?.insertId}`);
-    })
-    .catch((err: any) => {
-      console.error('[DATABASE ERROR] Gagal menyimpan rekaman live replay:', err);
-    });
+      io.emit('live-status', { 
+        isLive: true, 
+        videoId: currentLiveVideoId, 
+        streamKey, 
+        title: liveTitle 
+      });
 
-  currentStreamKey = '';
-  (global as any).isStreamActive = false;
-  (global as any).currentStreamKey = '';
-  
-  if (typeof (global as any).renderDashboard === 'function') (global as any).renderDashboard();
-  else if (typeof (global as any).drawInterface === 'function') (global as any).drawInterface();
-});
+      if (typeof (global as any).renderDashboard === 'function') (global as any).renderDashboard();
+      else if (typeof (global as any).drawInterface === 'function') (global as any).drawInterface();
+    } catch (err) {
+      console.error('[LIVE SYSTEM ERROR] Gagal inisialisasi sesi live stream:', err);
+    }
+  });
+
+  // 2. donePublish: Terpicu saat streamer menekan "Stop Streaming" di OBS
+  nms.on('donePublish', (session: any) => {
+    try {
+      console.log(`[LIVE SYSTEM] Siaran langsung dihentikan oleh streamer.`);
+      isStreamActive = false;
+      (global as any).isStreamActive = false;
+      io.emit('live-status', { isLive: false });
+
+      if (typeof (global as any).renderDashboard === 'function') (global as any).renderDashboard();
+      else if (typeof (global as any).drawInterface === 'function') (global as any).drawInterface();
+    } catch (err) {
+      console.error('[LIVE SYSTEM ERROR] Error pada donePublish:', err);
+    }
+  });
+
+  // 3. doneRecord: Terpicu ketika file rekaman selesai ditulis secara utuh oleh RecordServer
+  nms.on('doneRecord', async (recordSession: any) => {
+    try {
+      const recordedFilePath = recordSession?.filePath;
+      const streamName = recordSession?.streamName || currentStreamKey || 'live';
+      console.log(`[LIVE AUTO-ARCHIVE] File rekaman selesai ditulis: ${recordedFilePath}`);
+
+      // Validasi file rekaman: jika file tidak ada atau terlalu kecil (< 100 KB = siaran coba-coba singkat), batalkan
+      if (!recordedFilePath || !fs.existsSync(recordedFilePath) || fs.statSync(recordedFilePath).size < 100 * 1024) {
+        console.log(`[LIVE AUTO-ARCHIVE] File rekaman kosong atau terlalu singkat (< 100 KB). Mengabaikan encoding VOD.`);
+        if (currentLiveVideoId) {
+          await db.query("DELETE FROM Videos WHERE id = ? AND status = 'live'", [currentLiveVideoId]).catch(() => {});
+          currentLiveVideoId = null;
+        }
+        if (recordedFilePath && fs.existsSync(recordedFilePath)) {
+          try { fs.unlinkSync(recordedFilePath); } catch (e) {}
+        }
+        return;
+      }
+
+      const targetVideoId = currentLiveVideoId;
+      currentLiveVideoId = null;
+
+      if (!targetVideoId) {
+        console.warn(`[LIVE AUTO-ARCHIVE] Tidak ditemukan videoId aktif untuk file rekaman ${recordedFilePath}`);
+        return;
+      }
+
+      // Ubah status ke 'processing' (seperti YouTube Live VOD)
+      await db.query("UPDATE Videos SET status = 'processing' WHERE id = ?", [targetVideoId]);
+      io.emit('video-progress-' + targetVideoId, { status: 'processing', progress: 0 });
+
+      console.log(`[LIVE AUTO-ARCHIVE] Memasukkan Video ID ${targetVideoId} ke antrean FFmpeg Multi-Resolution Encoding...`);
+      // Masukkan ke antrean transcoding FFmpeg GPU (isObfuscated = false karena file FLV asli)
+      ffmpegTranscodeQueue.push(() => processVideo(targetVideoId, recordedFilePath, `live_record_${streamName}.flv`, undefined, false));
+      processNextInFFmpegQueue();
+    } catch (err) {
+      console.error('[LIVE AUTO-ARCHIVE ERROR] Gagal memproses rekaman siaran langsung:', err);
+    }
+  });
 
   // Jalankan Media Server di background
   nms.run();
-
-  // --- EVENT LISTENER LIFECYCLE LIVE STREAMING (TAHAP 44.2) ---
-  nms.on('postPublish', (id: string, StreamPath: string, args: any) => {
-      console.log(`[LIVE SYSTEM] Stream Terdeteksi Aktif! Path: ${StreamPath}`);
-      isStreamActive = true;
-      
-      // Ambil StreamKey dari Path (contoh: /live/stream_key_wiji_hub -> stream_key_wiji_hub)
-      const streamKey = StreamPath.split('/').pop() || 'stream_key_wiji_hub';
-      const hlsPlayUrl = `/live/${streamKey}/index.m3u8`;
-      const liveTitle = `Live Stream - ${new Date().toLocaleString('id-ID')}`;
-
-      // Catat Siaran Langsung ke Database MySQL
-      const sqlInsert = `INSERT INTO Videos (title, description, url, status, created_at) VALUES (?, ?, ?, 'live', NOW())`;
-      
-      db.query(sqlInsert, [liveTitle, 'Siaran langsung dari OmniHub Live Studio', hlsPlayUrl])
-          .then((result: any) => {
-              currentLiveVideoId = result[0]?.insertId;
-              console.log(`[DATABASE] Live Stream terdaftar di MySQL dengan VideoID: ${currentLiveVideoId}`);
-          })
-          .catch((err: any) => {
-              console.error('[DATABASE ERROR] Gagal mendaftarkan Live Stream:', err);
-          });
-  });
-
-  nms.on('donePublish', (id: string, StreamPath: string, args: any) => {
-      console.log(`[LIVE SYSTEM] Stream Berhenti. Path: ${StreamPath}`);
-      isStreamActive = false;
-
-      // Ubah status video di MySQL dari 'live' menjadi 'ready' agar tersimpan di Tab Live Creator Studio
-      if (currentLiveVideoId) {
-          const sqlUpdate = `UPDATE Videos SET status = 'ready' WHERE id = ?`;
-          db.query(sqlUpdate, [currentLiveVideoId])
-              .then(() => {
-                  console.log(`[DATABASE] Live Stream ID: ${currentLiveVideoId} berhasil diarsipkan ke VOD Studio!`);
-                  currentLiveVideoId = null;
-              })
-              .catch((err: any) => {
-                  console.error('[DATABASE ERROR] Gagal memperbarui status simpan live:', err);
-              });
-      }
-  });
 
   // --- PERSISTENT QUEUE RECOVERY ON BOOT (STAGE 1.7) ---
   const recoverUnfinishedQueue = async () => {

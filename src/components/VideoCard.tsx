@@ -154,12 +154,17 @@ export default function VideoCard({ video, onWatchLaterToggle }: VideoCardProps)
           </div>
         )}
 
-        {/* Duration Badge (YouTube Bottom Right Style) */}
-        {video.duration > 0 && (
+        {/* Live Badge or Duration Badge (YouTube Bottom Right Style) */}
+        {video.status === 'live' ? (
+          <div className="absolute bottom-2 right-2 bg-rose-600 text-white text-[10px] sm:text-xs font-black uppercase tracking-wider px-2 py-0.5 rounded-md shadow-lg flex items-center gap-1.5 animate-pulse z-10">
+            <span className="w-1.5 h-1.5 rounded-full bg-white animate-ping" />
+            LIVE
+          </div>
+        ) : video.duration > 0 ? (
           <div className="absolute bottom-2 right-2 bg-black/85 backdrop-blur-md text-white text-[10px] sm:text-xs font-bold px-1.5 py-0.5 rounded-md shadow-md border border-white/10 pointer-events-none">
             {formatDuration(video.duration)}
           </div>
-        )}
+        ) : null}
 
         {/* YOUTUBE-STYLE HOVER QUICK-ACTION BUTTONS (TOP RIGHT OF THUMBNAIL) */}
         <div className="absolute top-2 right-2 flex flex-col gap-1.5 opacity-0 group-hover:opacity-100 transition-all duration-200 z-20">
@@ -239,9 +244,18 @@ export default function VideoCard({ video, onWatchLaterToggle }: VideoCardProps)
             {video.firstName} {video.lastName}
           </button>
           <p className="text-neutral-500 text-[11px] font-medium mt-0.5 truncate flex items-center gap-1.5">
-            <span>{formatViews(video.views)}</span>
-            <span>•</span>
-            <span>{formatTimeAgo(video.created_at)}</span>
+            {video.status === 'live' ? (
+              <span className="text-rose-500 font-bold flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-rose-500" />
+                Sedang Disiarkan Langsung
+              </span>
+            ) : (
+              <>
+                <span>{formatViews(video.views)}</span>
+                <span>•</span>
+                <span>{formatTimeAgo(video.created_at)}</span>
+              </>
+            )}
           </p>
         </div>
 
