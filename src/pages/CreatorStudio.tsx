@@ -1,5 +1,6 @@
-import { useState, useEffect } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { useState, useEffect, useCallback, useMemo } from 'react';
+import { Link } from 'react-router-dom';
+import { io } from 'socket.io-client';
 import api from '../lib/api';
 import { PlayCircle, Eye, Clock, Video, BarChart2, Calendar, LayoutDashboard, UploadCloud } from 'lucide-react';
 import { motion } from 'motion/react';
@@ -7,6 +8,14 @@ import { cn, formatWatchTime } from '../lib/utils';
 import { Skeleton } from '../components/Skeleton';
 
 const API_BASE_URL = (import.meta as any).env?.VITE_API_URL?.replace(/\/api\/?$/, '') || '';
+
+type SortKey = 'newest' | 'views' | 'watch_time';
+
+const SORT_OPTIONS: { key: SortKey; label: string }[] = [
+  { key: 'newest', label: 'Terbaru' },
+  { key: 'views', label: 'Views' },
+  { key: 'watch_time', label: 'Watch Time' },
+];
 
 const getThumbnailUrl = (url?: string) => {
   if (!url) return '';
@@ -19,22 +28,120 @@ export default function CreatorStudio() {
   const [overview, setOverview] = useState<any>(null);
   const [videos, setVideos] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
-  const navigate = useNavigate();
+  const [sortBy, setSortBy] = useState<SortKey>('newest');
+
+  const fetchAnalytics = useCallback(async (silent = false) => {
+    try {
+      const res = await api.get('/creator/analytics');
+      setOverview(res.data.global);
+      setVideos(res.data.videos || []);
+    } catch (err) {
+      console.error("Failed to fetch creator analytics", err);
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
-    const fetchAnalytics = async () => {
-      try {
-        const res = await api.get('/creator/analytics');
-        setOverview(res.data.global);
-        setVideos(res.data.videos || []);
-      } catch (err) {
-        console.error("Failed to fetch creator analytics", err);
-      } finally {
-        setLoading(false);
+    fetchAnalytics(false);
+
+    const handleVisibilityOrFocus = () => {
+      if (document.visibilityState === 'visible') {
+        fetchAnalytics(true);
       }
     };
-    fetchAnalytics();
-  }, []);
+    window.addEventListener('focus', handleVisibilityOrFocus);
+    document.addEventListener('visibilitychange', handleVisibilityOrFocus);
+
+    const socket = io(API_BASE_URL || undefined, {
+      transports: ['websocket', 'polling'],
+      autoConnect: true,
+    });
+
+    const handleWatchTimeUpdate = (data: { videoId?: number; watch_time?: number }) => {
+      if (!data?.videoId) return;
+      const targetId = Number(data.videoId);
+      const nextWatchTime = Number(data.watch_time) || 0;
+      setVideos((prev) => {
+        let matched = false;
+        const next = prev.map((v) => {
+          if (Number(v.id) === targetId) {
+            matched = true;
+            const merged = Math.max(Number(v.watch_time ?? v.watch_time_seconds ?? 0), nextWatchTime);
+            return { ...v, watch_time: merged, watch_time_seconds: merged };
+          }
+          return v;
+        });
+        return matched ? next : prev;
+      });
+    };
+
+    const handleViewsUpdate = (data: { videoId?: number; views?: number }) => {
+      if (!data?.videoId) return;
+      const targetId = Number(data.videoId);
+      const nextViews = Number(data.views) || 0;
+      setVideos((prev) => {
+        let matched = false;
+        const next = prev.map((v) => {
+          if (Number(v.id) === targetId) {
+            matched = true;
+            return { ...v, views: Math.max(Number(v.views || 0), nextViews) };
+          }
+          return v;
+        });
+        return matched ? next : prev;
+      });
+    };
+
+    socket.on('video-watchtime-update', handleWatchTimeUpdate);
+    socket.on('video-views-update', handleViewsUpdate);
+
+    return () => {
+      window.removeEventListener('focus', handleVisibilityOrFocus);
+      document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
+      socket.off('video-watchtime-update', handleWatchTimeUpdate);
+      socket.off('video-views-update', handleViewsUpdate);
+      socket.disconnect();
+    };
+  }, [fetchAnalytics]);
+
+  const totals = useMemo(() => {
+    const hasVideos = videos.length > 0;
+    const totalVideos = hasVideos ? videos.length : Number(overview?.totalVideos || 0);
+    const totalViews = hasVideos
+      ? videos.reduce((sum, v) => sum + (Number(v.views) || 0), 0)
+      : Number(overview?.totalViews || 0);
+    const totalWatchTime = hasVideos
+      ? videos.reduce((sum, v) => sum + (Number(v.watch_time ?? v.watch_time_seconds ?? 0) || 0), 0)
+      : Number(overview?.totalWatchTime || 0);
+    const watchedVideosCount = hasVideos
+      ? videos.reduce((count, v) => count + (Number(v.watch_time ?? v.watch_time_seconds ?? 0) > 0 ? 1 : 0), 0)
+      : Number(overview?.watchedVideosCount || 0);
+    const avgPerVideo = totalVideos > 0 ? Math.round(totalWatchTime / totalVideos) : 0;
+
+    return {
+      totalVideos,
+      totalViews,
+      totalWatchTime,
+      watchedVideosCount,
+      avgPerVideo,
+    };
+  }, [videos, overview]);
+
+  const sortedVideos = useMemo(() => {
+    const list = [...videos];
+    if (sortBy === 'views') {
+      return list.sort((a, b) => (Number(b.views) || 0) - (Number(a.views) || 0));
+    }
+    if (sortBy === 'watch_time') {
+      return list.sort(
+        (a, b) =>
+          (Number(b.watch_time ?? b.watch_time_seconds) || 0) -
+          (Number(a.watch_time ?? a.watch_time_seconds) || 0)
+      );
+    }
+    return list;
+  }, [videos, sortBy]);
 
   if (loading) {
     return (
@@ -84,7 +191,7 @@ export default function CreatorStudio() {
             </div>
             <div className="text-sm font-black text-neutral-400 uppercase tracking-widest mb-2">Total Views</div>
             <div className="text-4xl font-black text-neutral-900 dark:text-white font-display">
-              {(overview?.totalViews || 0).toLocaleString()}
+              {totals.totalViews.toLocaleString()}
             </div>
           </div>
         </motion.div>
@@ -104,8 +211,11 @@ export default function CreatorStudio() {
             </div>
             <div className="text-sm font-black text-neutral-400 uppercase tracking-widest mb-2">Total Watch Time</div>
             <div className="text-4xl font-black text-neutral-900 dark:text-white font-display">
-              {formatWatchTime(overview?.totalWatchTime || 0)}
+              {formatWatchTime(totals.totalWatchTime)}
             </div>
+            <p className="text-xs font-medium text-neutral-500 dark:text-neutral-400 mt-2">
+              Total dari {totals.watchedVideosCount.toLocaleString()} / {totals.totalVideos.toLocaleString()} video • Rata-rata {formatWatchTime(totals.avgPerVideo)}/video
+            </p>
           </div>
         </motion.div>
 
@@ -124,18 +234,37 @@ export default function CreatorStudio() {
             </div>
             <div className="text-sm font-black text-neutral-400 uppercase tracking-widest mb-2">Total Videos</div>
             <div className="text-4xl font-black text-neutral-900 dark:text-white font-display">
-              {(overview?.totalVideos || 0).toLocaleString()}
+              {totals.totalVideos.toLocaleString()}
             </div>
           </div>
         </motion.div>
       </div>
 
       <div className="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-3xl overflow-hidden shadow-sm">
-        <div className="p-6 border-b border-neutral-200 dark:border-neutral-800 flex items-center gap-3">
-          <BarChart2 className="text-brand-600" />
-          <h2 className="text-xl font-black text-neutral-900 dark:text-white font-display tracking-tight">
-            Video Performance
-          </h2>
+        <div className="p-6 border-b border-neutral-200 dark:border-neutral-800 flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <BarChart2 className="text-brand-600" />
+            <h2 className="text-xl font-black text-neutral-900 dark:text-white font-display tracking-tight">
+              Video Performance
+            </h2>
+          </div>
+          <div className="flex items-center gap-1.5 bg-neutral-100 dark:bg-neutral-800/70 p-1 rounded-xl">
+            {SORT_OPTIONS.map((opt) => (
+              <button
+                key={opt.key}
+                type="button"
+                onClick={() => setSortBy(opt.key)}
+                className={cn(
+                  'px-3 py-1.5 rounded-lg text-xs font-bold transition-colors',
+                  sortBy === opt.key
+                    ? 'bg-brand-600 text-white shadow-sm'
+                    : 'text-neutral-600 dark:text-neutral-300 hover:text-neutral-900 dark:hover:text-white'
+                )}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full">
@@ -148,7 +277,7 @@ export default function CreatorStudio() {
               </tr>
             </thead>
             <tbody className="divide-y divide-neutral-100 dark:divide-neutral-800">
-              {videos.map((video: any) => {
+              {sortedVideos.map((video: any) => {
                 const thumbSrc = getThumbnailUrl(video.thumbnail_url || video.thumbnail);
                 return (
                   <tr key={video.id} className="hover:bg-neutral-50 dark:hover:bg-neutral-800/50 transition-colors group">

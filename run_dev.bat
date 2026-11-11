@@ -1,12 +1,13 @@
 @echo off
 cd /d "%~dp0"
-title OmniHub Reporting Server
+title OmniHub Server - Live Terminal Logs
 set OMNIHUB_MANAGED_RESTART=1
 
 :server_loop
 cls
 echo ========================================================
-echo   Memulai OmniHub Reporting Server Control Center...
+echo   OMNIHUB LIVE LOGGING SERVER (Terminal Mode)
+echo   Seluruh log HTTP, Socket.IO, RTMP, & GPU Encoding
 echo ========================================================
 call npm run dev
 set EXIT_STATUS=%ERRORLEVEL%

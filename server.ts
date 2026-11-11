@@ -1,4 +1,4 @@
-import { spawn, execSync } from "node:child_process";
+import { spawn, execSync, execFile } from "node:child_process";
 import express from 'express';
 import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
@@ -21,10 +21,49 @@ const getAiInstance = () => {
 const aiApiKey = getAiApiKey();
 const aiInstance = getAiInstance();
 import http from 'node:http';
+import net from 'node:net';
+import os from 'node:os';
 import { Server } from 'socket.io';
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
+
+// --- SYSTEM RESOURCE TELEMETRY HELPERS ---
+function getCpuSnapshot() {
+  const cpus = os.cpus();
+  let idle = 0, total = 0;
+  for (const cpu of cpus) {
+    for (const type in cpu.times) {
+      total += (cpu.times as any)[type];
+    }
+    idle += cpu.times.idle;
+  }
+  return { idle, total, time: Date.now() };
+}
+
+let lastCpuSample = getCpuSnapshot();
+let lastCalculatedCpu = 12;
+
+function getCpuUsagePercent(): number {
+  const current = getCpuSnapshot();
+  const timeDiff = current.time - lastCpuSample.time;
+  if (timeDiff >= 300) {
+    const idleDiff = current.idle - lastCpuSample.idle;
+    const totalDiff = current.total - lastCpuSample.total;
+    if (totalDiff > 0) {
+      lastCalculatedCpu = Math.max(0, Math.min(100, Math.round((1 - (idleDiff / totalDiff)) * 100)));
+    }
+    lastCpuSample = current;
+  }
+  return lastCalculatedCpu;
+}
+
+function getMemoryUsagePercent(): number {
+  const total = os.totalmem();
+  const free = os.freemem();
+  if (total <= 0) return 0;
+  return Math.max(0, Math.min(100, Math.round(((total - free) / total) * 100)));
+}
 
 // --- DEKLARASI Wajib ESM __DIRNAME (TAHAP 44.3) ---
 const __filename = fileURLToPath(import.meta.url);
@@ -32,6 +71,11 @@ const __dirname = path.dirname(__filename);
 // @ts-ignore
 import NodeMediaServer from 'node-media-server';
 import { initDashboard, logBox } from './lib/dashboard';
+
+// --- DYNAMIC PORT TRACKERS (HTTP, SOCKET.IO & RTMP) ---
+let currentAppPort = 3000;
+let currentRtmpPort = 1935;
+let currentNmsHttpPort = 8005;
 
 // --- STATE LIVE STREAM TRACKER (TAHAP 43/44.4) ---
 let isStreamActive = false;
@@ -49,23 +93,29 @@ const originalError = console.error;
 const originalWarn = console.warn;
 
 console.log = (...args) => {
-  const msg = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
   if (typeof logBox !== 'undefined' && logBox && typeof logBox.log === 'function') {
+    const msg = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
     logBox.log(msg);
+  } else {
+    originalLog(...args);
   }
 };
 
 console.error = (...args) => {
-  const msg = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
   if (typeof logBox !== 'undefined' && logBox && typeof logBox.log === 'function') {
+    const msg = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
     logBox.log(`[ERROR] ${msg}`);
+  } else {
+    originalError(...args);
   }
 };
 
 console.warn = (...args) => {
-  const msg = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
   if (typeof logBox !== 'undefined' && logBox && typeof logBox.log === 'function') {
+    const msg = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
     logBox.log(`[WARN] ${msg}`);
+  } else {
+    originalWarn(...args);
   }
 };
 // ----------------------------------------------
@@ -298,35 +348,191 @@ app.post('/api/admin/config', (req, res) => {
         res.status(500).json({ error: true, message: 'Gagal menyimpan konfigurasi' });
     }
 });
+
+// Endpoint GET profil arsitektur & kapabilitas GPU (Ampere vs Maxwell / GTX 900 series)
+app.get('/api/admin/gpu-profile', (req, res) => {
+    res.json(gpuProfile);
+});
+
+// ============================================================================
+// HARDWARE DETECTION & DYNAMIC GPU ACCELERATION PROFILER
+// Kompatibilitas Lintas Generasi: Maxwell (GTX 900 series, CC 5.0/5.2) s/d Ampere/Ada (RTX 30/40 series)
+// ============================================================================
+export interface GpuHardwareProfile {
+  detected: boolean;
+  name: string;
+  computeCapability: number;
+  driverVersion: string;
+  totalMemoryMb: number;
+  architecture: 'Maxwell' | 'Pascal' | 'Turing' | 'Ampere' | 'Ada' | 'Unknown';
+  supportsTemporalAQ: boolean;
+  recommendedPreset: string;
+}
+
+export function detectGpuHardwareProfile(): GpuHardwareProfile {
+  try {
+    const rawOutput = execSync(
+      'nvidia-smi --query-gpu=name,compute_cap,driver_version,memory.total --format=csv,noheader,nounits',
+      { encoding: 'utf8', timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] }
+    ).trim();
+
+    if (!rawOutput) throw new Error('nvidia-smi returned empty output');
+
+    const lines = rawOutput.split(/\r?\n/).filter(line => line.trim().length > 0);
+    const [name, capStr, driver, memStr] = lines[0].split(',').map(s => s.trim());
+    const computeCap = parseFloat(capStr) || 0;
+    const totalMemoryMb = parseInt(memStr, 10) || 0;
+
+    let architecture: GpuHardwareProfile['architecture'] = 'Unknown';
+    if (computeCap >= 8.9) architecture = 'Ada';
+    else if (computeCap >= 8.0) architecture = 'Ampere';
+    else if (computeCap >= 7.5) architecture = 'Turing';
+    else if (computeCap >= 6.0) architecture = 'Pascal';
+    else if (computeCap >= 5.0) architecture = 'Maxwell';
+
+    // Maxwell (GTX 900 series, CC 5.0 / 5.2) TIDAK mendukung Temporal AQ (-temporal_aq 1).
+    // Memberikan flag -temporal_aq 1 ke Maxwell akan menyebabkan crash 'Temporal AQ is not supported on this hardware!'.
+    // Pascal (CC 6.0+) dan generasi yang lebih baru mendukung Temporal AQ secara native.
+    const supportsTemporalAQ = computeCap >= 6.0;
+
+    // Preset compatibility:
+    // Preset 'p4' diperkenalkan pada NVENC SDK 10 (Turing/Ampere). Driver / ffmpeg pada GTX 900 series (Maxwell)
+    // memerlukan preset universal 'medium' agar encoding berjalan mulus tanpa penolakan opsi.
+    const recommendedPreset = computeCap >= 6.0 ? 'p4' : 'medium';
+
+    const profile: GpuHardwareProfile = {
+      detected: true,
+      name,
+      computeCapability: computeCap,
+      driverVersion: driver,
+      totalMemoryMb,
+      architecture,
+      supportsTemporalAQ,
+      recommendedPreset
+    };
+
+    console.log(`[GPU PROBE] ✅ Terdeteksi GPU: ${name} (${architecture}, Compute CC ${computeCap}, VRAM: ${totalMemoryMb} MB, Driver: ${driver})`);
+    console.log(`[GPU PROBE] ⚙️ Konfigurasi NVENC: Temporal AQ=${supportsTemporalAQ ? 'Aktif' : 'Nonaktif (Maxwell Safe)'}, Preset=${recommendedPreset}`);
+
+    return profile;
+  } catch (err: any) {
+    console.warn('[GPU PROBE] ⚠️ Gagal mendeteksi GPU NVIDIA via nvidia-smi. Menggunakan profil kompatibilitas universal aman.', err?.message || err);
+    return {
+      detected: false,
+      name: 'Unknown / Fallback',
+      computeCapability: 0,
+      driverVersion: 'Unknown',
+      totalMemoryMb: 0,
+      architecture: 'Unknown',
+      supportsTemporalAQ: false,
+      recommendedPreset: 'medium'
+    };
+  }
+}
+
+export const gpuProfile = detectGpuHardwareProfile();
 // ------------------------------------------
 const server = http.createServer(app);
 // Setting up socket.io
 const io = new Server(server, { cors: { origin: '*' } });
 
-// Sistem antrean FIFO ketat (1 proses dalam satu waktu) untuk mencegah saturasi GPU RTX 3050
-const videoQueue = new PQueue({ concurrency: 1 });
+// ============================================================================
+// FAIR-SHARE MULTI-TENANT GPU TRANSCODING SCHEDULER (MAX 2 GLOBAL, MAX 1/USER)
+// ============================================================================
+interface TranscodeJob {
+  videoId: number;
+  userId: number;
+  inputPath: string;
+  originalFilename: string;
+  uploadId?: string;
+  isObfuscated?: boolean;
+}
 
-// --- FFMPEG NVENC BATCH QUEUE WORKER (TAHAP 52) ---
-const ffmpegTranscodeQueue: Array<() => Promise<void>> = [];
-let isTranscodingActive = false;
+// Konfigurasi Antrean Cerdas:
+// Maksimal 2 proses GPU paralel global (Sangat aman untuk RTX 3050 Laptop & GTX 950 4GB VRAM)
+// Maksimal 1 proses per pengguna (Menjamin keadilan agar user lain tidak terblokir oleh bulk upload)
+const MAX_GLOBAL_CONCURRENT_TRANSCODES = 2;
+const MAX_PER_USER_CONCURRENT_TRANSCODES = 1;
+
+const transcodeQueue: TranscodeJob[] = [];
+const activeTranscodingJobs = new Map<number, TranscodeJob>(); // videoId -> TranscodeJob
+const activeUsersTranscoding = new Map<number, number>(); // userId -> count of active jobs
+
+const isVideoActiveOrQueued = (videoId: number): boolean => {
+  return activeTranscodingJobs.has(videoId) || transcodeQueue.some(job => job.videoId === videoId);
+};
+
+const getActiveUserTranscodeCount = (userId: number): number => {
+  return activeUsersTranscoding.get(userId) || 0;
+};
+
 let currentTranscodingVideoId: number | null = null;
 
-const processNextInFFmpegQueue = async () => {
-  if (isTranscodingActive || ffmpegTranscodeQueue.length === 0) return;
-  isTranscodingActive = true;
-  const nextJob = ffmpegTranscodeQueue.shift();
-  if (nextJob) {
-    try {
-      await nextJob();
-    } catch (e) {
-      console.error('[FFMPEG QUEUE ERROR]:', e);
-    } finally {
-      currentTranscodingVideoId = null;
-      isTranscodingActive = false;
-      processNextInFFmpegQueue(); // Lanjut ke antrean berikutnya
+// Dispatcher Antrean Berkeadilan (Fair-Share Dispatcher)
+const dispatchNextTranscodeJobs = () => {
+  while (activeTranscodingJobs.size < MAX_GLOBAL_CONCURRENT_TRANSCODES && transcodeQueue.length > 0) {
+    // Cari job pertama dalam antrean yang user-nya belum mencapai batas kuota per-user
+    const eligibleIndex = transcodeQueue.findIndex(job => {
+      const userActiveCount = getActiveUserTranscodeCount(job.userId);
+      return userActiveCount < MAX_PER_USER_CONCURRENT_TRANSCODES;
+    });
+
+    if (eligibleIndex === -1) {
+      // Seluruh job yang tersisa di antrean adalah milik user yang sedang aktif di slot GPU
+      // Job-job ini akan menunggu giliran setelah job aktif mereka selesai
+      break;
     }
+
+    // Ambil job yang lolos syarat fair-share
+    const [job] = transcodeQueue.splice(eligibleIndex, 1);
+
+    // Daftarkan sebagai job aktif
+    activeTranscodingJobs.set(job.videoId, job);
+    activeUsersTranscoding.set(job.userId, getActiveUserTranscodeCount(job.userId) + 1);
+    currentTranscodingVideoId = job.videoId;
+
+    console.log(`[FAIR-SHARE SCHEDULER] 🚀 Menjalankan Transcoding VideoID: ${job.videoId} untuk UserID: ${job.userId} (Slot GPU Aktif: ${activeTranscodingJobs.size}/${MAX_GLOBAL_CONCURRENT_TRANSCODES}, Sisa Antrean: ${transcodeQueue.length})`);
+
+    // Eksekusi transcoding secara asinkron agar slot berikutnya dapat segera terisi jika memenuhi syarat
+    (async () => {
+      try {
+        await processVideo(job.videoId, job.inputPath, job.originalFilename, job.uploadId, job.isObfuscated ?? true);
+      } catch (err) {
+        console.error(`[FAIR-SHARE SCHEDULER ERROR] Gagal proses VideoID: ${job.videoId}:`, err);
+      } finally {
+        // Lepaskan slot GPU & kurangi counter aktif pengguna
+        activeTranscodingJobs.delete(job.videoId);
+        const currentCount = getActiveUserTranscodeCount(job.userId);
+        if (currentCount <= 1) {
+          activeUsersTranscoding.delete(job.userId);
+        } else {
+          activeUsersTranscoding.set(job.userId, currentCount - 1);
+        }
+
+        currentTranscodingVideoId = activeTranscodingJobs.keys().next().value || null;
+        console.log(`[FAIR-SHARE SCHEDULER] 🏁 VideoID: ${job.videoId} selesai. Slot GPU Bebas: ${MAX_GLOBAL_CONCURRENT_TRANSCODES - activeTranscodingJobs.size}/${MAX_GLOBAL_CONCURRENT_TRANSCODES}. Memeriksa antrean berikutnya...`);
+
+        // Trigger dispatcher untuk mengambil job berikutnya
+        dispatchNextTranscodeJobs();
+      }
+    })();
   }
 };
+
+const queueTranscodeJob = (job: TranscodeJob) => {
+  if (isVideoActiveOrQueued(job.videoId)) {
+    console.log(`[FAIR-SHARE SCHEDULER] VideoID ${job.videoId} sudah ada di antrean atau sedang aktif.`);
+    return;
+  }
+  transcodeQueue.push(job);
+  console.log(`[FAIR-SHARE SCHEDULER] 📥 Menambahkan VideoID ${job.videoId} (UserID: ${job.userId}) ke antrean. Total antrean: ${transcodeQueue.length}`);
+  dispatchNextTranscodeJobs();
+};
+
+// Aliases untuk backward compatibility jika ada modul/stats yang merujuk variabel lama
+const isTranscodingActive = () => activeTranscodingJobs.size > 0;
+const ffmpegTranscodeQueue = transcodeQueue;
+const processNextInFFmpegQueue = dispatchNextTranscodeJobs;
 
 app.use(express.json());
 
@@ -751,7 +957,7 @@ async function generateGeminiAutoReportAsync(videoId: number, candidateVideoPath
     }
 
     const [videoMetaRows]: any = await db.query(
-      'SELECT title, description, student_name, program_id, meeting_number, session_date FROM Videos WHERE id = ?',
+      'SELECT title, description, student_name, program_id, meeting_number, session_date, teacher_note FROM Videos WHERE id = ?',
       [videoId]
     );
 
@@ -762,6 +968,7 @@ async function generateGeminiAutoReportAsync(videoId: number, candidateVideoPath
     const sessionDateStr = meta.session_date
       ? new Date(meta.session_date).toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' })
       : new Date().toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' });
+    const teacherNote = meta.teacher_note ? meta.teacher_note.trim() : '';
 
     if (!programId) {
       console.log(`[GEMINI] VideoID: ${videoId} tidak memiliki program_id. Melewati auto-report.`);
@@ -785,7 +992,7 @@ async function generateGeminiAutoReportAsync(videoId: number, candidateVideoPath
 
     const promptText = `Kamu adalah Asisten Pengajar & Pembuat Laporan Pembelajaran Otomatis untuk Koding Akademi di OmniHub.
 Tugasmu adalah menganalisis berkas video pembelajaran yang diberikan dan mengekstrak materi serta ringkasan pembelajaran hari ini.
-
+${teacherNote ? `\nCATATAN KHUSUS DARI PENGAJAR:\n"${teacherNote}"\n` : ''}
 Keluaran WAJIB berupa blok kode (markdown code block) dengan format persis seperti ini:
 
 \`\`\`text
@@ -798,13 +1005,13 @@ Program : ${programName}
 Materi: [Tuliskan ringkasan singkat materi teknis yang dipelajari di video]
 Pembelajaran hari ini : [Tuliskan 2-4 kalimat detail aktivitas siswa, perangkat/kode yang dibuat, serta kendala/troubleshooting yang berhasil diselesaikan]
 
-Note :Good Job ${studentName}, [Tuliskan kata-kata penyemangat yang relevan dengan pembelajaran siswa]
+Note :Good Job ${studentName}, [Tuliskan kata-kata apresiasi/penyemangat yang relevan dengan pembelajaran siswa${teacherNote ? ` dan leburkan catatan khusus dari pengajar berikut: "${teacherNote}"` : ''}]
 \`\`\`
 
 Aturan Penulisan:
 1. "Materi" berupa ringkasan topik teknis yang dibahas dalam video.
 2. "Pembelajaran hari ini" menceritakan aktivitas siswa dalam video secara profesional dan ramah.
-3. "Note" wajib diawali dengan "Good Job ${studentName}," diikuti kata penyemangat.
+3. "Note" wajib diawali dengan "Good Job ${studentName},". ${teacherNote ? `Pengajar memberikan catatan observasi khusus: "${teacherNote}". Gabungkan dan leburkan catatan pengajar ini secara alami, positif, dan memotivasi ke dalam bagian Note.` : 'Tuliskan kata-kata penyemangat dan evaluasi positif yang relevan.'}
 4. TAMPILKAN HANYA BLOK KODE KELUARAN TANPA TEKS PENGANTAR LAIN.`;
 
     const modelName = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
@@ -943,6 +1150,123 @@ Aturan Penulisan:
 // ============================================================================
 // 5. MULTI-RESOLUTION FFMPEG GPU CUDA (RTX 3050 HARDWARE PIPELINE)
 // ============================================================================
+interface ProbedVideoMetadata {
+  duration: number;
+  sourceWidth: number;
+  sourceHeight: number;
+  sourcePixFmt: string;
+  effectiveWidth: number;
+  effectiveHeight: number;
+  normalizedRotation: number;
+  isVertical: boolean;
+  isHardwareDecodeIncompatible: boolean;
+}
+
+/**
+ * Probes video container metadata via direct ffprobe JSON output (preserving side_data_list
+ * that fluent-ffmpeg flattens/omits) and computes true display dimensions and orientation.
+ */
+async function probeVideoMetadata(filePath: string): Promise<ProbedVideoMetadata> {
+  const metadata = await new Promise<any>((resolve) => {
+    execFile(
+      FFPROBE_PATH,
+      ['-v', 'error', '-show_streams', '-show_format', '-of', 'json', filePath],
+      { maxBuffer: 10 * 1024 * 1024 },
+      (err, stdout) => {
+        if (!err && stdout) {
+          try {
+            return resolve(JSON.parse(stdout));
+          } catch {
+            // Fall through to fluent-ffmpeg fallback
+          }
+        }
+        ffmpeg.ffprobe(filePath, (probeErr: any, data: any) => {
+          resolve(probeErr ? null : data);
+        });
+      }
+    );
+  });
+
+  const streams = Array.isArray(metadata?.streams) ? metadata.streams : [];
+  const videoStream =
+    streams.find((s: any) => s.codec_type === 'video' && s.disposition?.attached_pic !== 1) ||
+    streams.find((s: any) => s.codec_type === 'video');
+
+  const rawDur = parseFloat(metadata?.format?.duration ?? videoStream?.duration ?? 0);
+  const duration = !isNaN(rawDur) && rawDur > 0 ? Math.round(rawDur) : 0;
+
+  if (!videoStream) {
+    return {
+      duration,
+      sourceWidth: 0,
+      sourceHeight: 0,
+      sourcePixFmt: '',
+      effectiveWidth: 0,
+      effectiveHeight: 0,
+      normalizedRotation: 0,
+      isVertical: false,
+      isHardwareDecodeIncompatible: false,
+    };
+  }
+
+  const sourceWidth = Number(videoStream.width) || 0;
+  const sourceHeight = Number(videoStream.height) || 0;
+  const sourcePixFmt = (videoStream.pix_fmt || '').toLowerCase();
+
+  let rawRotation = 0;
+  if (Array.isArray(videoStream.side_data_list)) {
+    const displayMatrix = videoStream.side_data_list.find(
+      (sd: any) => sd.rotation !== undefined || (sd.side_data_type || '').toLowerCase().includes('display matrix')
+    );
+    if (displayMatrix && displayMatrix.rotation !== undefined) {
+      rawRotation = Number(displayMatrix.rotation) || 0;
+    }
+  }
+  if (!rawRotation && videoStream.rotation !== undefined) {
+    rawRotation = Number(videoStream.rotation) || 0;
+  }
+  if (!rawRotation && (videoStream.tags?.rotate ?? videoStream.tags?.Rotate) !== undefined) {
+    rawRotation = Number(videoStream.tags?.rotate ?? videoStream.tags?.Rotate) || 0;
+  }
+  if (!rawRotation && (metadata?.format?.tags?.rotate ?? metadata?.format?.tags?.Rotate) !== undefined) {
+    rawRotation = Number(metadata.format.tags.rotate ?? metadata.format.tags.Rotate) || 0;
+  }
+
+  const normalizedRotation = ((Math.round(rawRotation) % 360) + 360) % 360;
+  const isRotatedSideways = normalizedRotation === 90 || normalizedRotation === 270;
+
+  // Apply non-square SAR if present so effective display aspect ratio reflects actual presentation
+  let displayWidthBeforeRotate = sourceWidth;
+  if (typeof videoStream.sample_aspect_ratio === 'string' && videoStream.sample_aspect_ratio.includes(':')) {
+    const [sarW, sarH] = videoStream.sample_aspect_ratio.split(':').map(Number);
+    if (sarW > 0 && sarH > 0 && sarW !== sarH) {
+      displayWidthBeforeRotate = Math.round(sourceWidth * (sarW / sarH));
+    }
+  }
+
+  const effectiveWidth = isRotatedSideways ? sourceHeight : displayWidthBeforeRotate;
+  const effectiveHeight = isRotatedSideways ? displayWidthBeforeRotate : sourceHeight;
+  const isVertical = effectiveHeight > effectiveWidth;
+
+  const isPixelFormatIncompatible =
+    sourcePixFmt.includes('444') || sourcePixFmt.includes('rgb') || sourcePixFmt.includes('bgr');
+  // NVDEC (-hwaccel cuda) ignores display matrix rotation tags and drops them on output;
+  // force software decode (Tier 2 Robust NVENC) so FFmpeg physically autorotates frames upright.
+  const isHardwareDecodeIncompatible = isPixelFormatIncompatible || normalizedRotation !== 0;
+
+  return {
+    duration,
+    sourceWidth,
+    sourceHeight,
+    sourcePixFmt,
+    effectiveWidth,
+    effectiveHeight,
+    normalizedRotation,
+    isVertical,
+    isHardwareDecodeIncompatible,
+  };
+}
+
 function processVideo(videoId: number, inputPath: string, originalFilename: string, uploadId?: string, isObfuscated: boolean = true): Promise<void> {
   return new Promise(async (resolveQueue, rejectQueue) => {
     const startTime = Date.now();
@@ -961,17 +1285,10 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
         }
       }
 
-      // Probe exact video duration using ffprobe
-      let detectedVideoDuration = 0;
-      try {
-        const probeOut = execSync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${inputPath}"`).toString().trim();
-        const parsedDur = parseFloat(probeOut);
-        if (!isNaN(parsedDur) && parsedDur > 0) {
-          detectedVideoDuration = Math.round(parsedDur);
-          console.log(`[FFPROBE] Detected Video Duration for VideoID ${videoId}: ${detectedVideoDuration}s`);
-        }
-      } catch (probeErr) {
-        console.warn(`[FFPROBE] Could not detect video duration for VideoID ${videoId}:`, probeErr);
+      const videoMeta = await probeVideoMetadata(activeInputPath);
+      const detectedVideoDuration = videoMeta.duration;
+      if (detectedVideoDuration > 0) {
+        console.log(`[FFPROBE] Detected Video Duration for VideoID ${videoId}: ${detectedVideoDuration}s`);
       }
 
       let highestResUrl = '';
@@ -1017,32 +1334,14 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
 
       await db.execute('UPDATE Videos SET thumbnail_url = ? WHERE id = ?', [`/${relativeThumbPath}`, videoId]);
 
-      // Probe Source Video Resolution
-      const metadataStr = await new Promise<any>((resolve, reject) => {
-        ffmpeg.ffprobe(activeInputPath, (err: any, data: any) => {
-          if (err) resolve(null);
-          else resolve(data);
-        });
-      });
-      
-      let sourceHeight = 0;
-      let sourceWidth = 0;
-      let sourcePixFmt = '';
-      let isSourceHardwareDecodeIncompatible = false;
-      if (metadataStr && metadataStr.streams) {
-        const videoStream = metadataStr.streams.find((s: any) => s.codec_type === 'video');
-        if (videoStream) {
-          sourceHeight = videoStream.height || 0;
-          sourceWidth = videoStream.width || 0;
-          sourcePixFmt = (videoStream.pix_fmt || '').toLowerCase();
-          console.log(`[SYSTEM] Detected source video resolution: ${sourceWidth}x${sourceHeight}, pix_fmt: ${sourcePixFmt}`);
-          // GeForce RTX NVDEC lacks hardware decoding for H.264 4:4:4 (common in Zoom/screen captures) or RGB surfaces
-          if (sourcePixFmt.includes('444') || sourcePixFmt.includes('rgb') || sourcePixFmt.includes('bgr')) {
-            isSourceHardwareDecodeIncompatible = true;
-            console.log(`[SYSTEM] Input video pixel format (${sourcePixFmt}) requires software decoding fallback.`);
-          }
-        }
+      const { effectiveWidth, effectiveHeight, normalizedRotation, isVertical, sourceWidth, sourceHeight, sourcePixFmt } = videoMeta;
+      let isSourceHardwareDecodeIncompatible = videoMeta.isHardwareDecodeIncompatible;
+
+      console.log(`[SYSTEM] Detected source video resolution: ${sourceWidth}x${sourceHeight}, pix_fmt: ${sourcePixFmt}, rotation: ${normalizedRotation}°`);
+      if (normalizedRotation !== 0) {
+        console.log(`[SYSTEM] Video memiliki rotasi ${normalizedRotation}°. Mengalihkan ke software decode agar orientasi tegak terjaga sempurna.`);
       }
+      console.log(`[SYSTEM] Effective orientation: ${effectiveWidth}x${effectiveHeight} (${isVertical ? 'PORTRAIT' : 'LANDSCAPE'})`);
 
       // Phase 1 (Efficiency Pass) & Phase 2 (Quality Pass) Hybrid Transcoding
       let activeResolutions = Object.entries(encodingSettings).filter(([_, config]: any) => config.active);
@@ -1058,9 +1357,10 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
       }
       // ---------------------------------------
       
-      // Adaptive input mechanism: skip generating output resolutions higher than source height
-      if (sourceHeight > 0) {
-        activeResolutions = activeResolutions.filter(([_, config]: any) => config.height <= sourceHeight + 16);
+      // Adaptive input mechanism: skip generating output resolutions higher than source short dimension
+      const sourceMinDim = Math.min(effectiveWidth, effectiveHeight);
+      if (sourceMinDim > 0) {
+        activeResolutions = activeResolutions.filter(([_, config]: any) => config.height <= sourceMinDim + 16);
         if (activeResolutions.length === 0) {
            const smallest = Object.entries(encodingSettings).filter(([_, config]: any) => config.active).sort((a: any, b: any) => a[1].height - b[1].height)[0];
            if (smallest) activeResolutions.push(smallest);
@@ -1099,15 +1399,23 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
           '360p':  { name: '360p',  width: 640,  height: 360,  bitrate: '350k',  maxrate: '500k',  bufsize: '700k',  cq: 32 }
         };
 
-        // --- TAHAP 67.0: ASPECT RATIO SAFEGUARD ---
-        const buildPureGPUVRAMArgs = (inputPath: string, outputPath: string, targetResName: string, srcW: number, srcH: number) => {
-          const profile = RESOLUTION_PROFILES[targetResName] || RESOLUTION_PROFILES['720p'];
-          const isVertical = srcH > srcW;
-          const scaleFilter = isVertical 
-            ? `scale_cuda=-2:${profile.height}` 
-            : `scale_cuda=${profile.width}:-2`;
+        const getTargetBox = (profile: ResolutionProfile) => ({
+          targetW: isVertical ? profile.height : profile.width,
+          targetH: isVertical ? profile.width : profile.height,
+        });
 
-          return [
+        const buildSoftwareScaleFilter = (profile: ResolutionProfile) => {
+          const { targetW, targetH } = getTargetBox(profile);
+          return `scale=${targetW}:${targetH}:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p`;
+        };
+
+        // --- TAHAP 67.0: ASPECT RATIO SAFEGUARD ---
+        const buildPureGPUVRAMArgs = (inputPath: string, outputPath: string, targetResName: string) => {
+          const profile = RESOLUTION_PROFILES[targetResName] || RESOLUTION_PROFILES['720p'];
+          const { targetW, targetH } = getTargetBox(profile);
+          const scaleFilter = `scale_cuda=${targetW}:${targetH}:force_original_aspect_ratio=decrease:force_divisible_by=2:reset_sar=1`;
+
+          const args = [
             '-progress', 'pipe:1',
             '-nostats',
             
@@ -1123,31 +1431,37 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
             '-i', inputPath,
             '-vf', scaleFilter,
             '-c:v', 'h264_nvenc',
-            '-preset', 'p4',               // P4: Optimal Speed & Compression Ratio
+            '-preset', gpuProfile.recommendedPreset,
             '-rc', 'vbr',                  // Variable Bitrate Mode
             '-cq', profile.cq.toString(),  // Constant Quality Threshold
             '-b:v', profile.bitrate,       // Target Average Bitrate
             '-maxrate', profile.maxrate,   // Peak Maximum Bitrate
             '-bufsize', profile.bufsize,   // Rate Control Buffer
-            '-spatial_aq', '1',            // Spatial Adaptive Quantization (Ketajaman Tekstur)
-            '-temporal_aq', '1',           // Temporal Adaptive Quantization (Anti-Artifact Frame)
+            '-spatial_aq', '1'             // Spatial Adaptive Quantization (Ketajaman Tekstur - Didukung Maxwell & Ampere)
+          ];
+
+          // Temporal AQ hanya untuk Pascal (CC 6.0) ke atas (Mencegah crash pada GTX 900 series / Maxwell)
+          if (gpuProfile.supportsTemporalAQ) {
+            args.push('-temporal_aq', '1');
+          }
+
+          args.push(
             '-c:a', 'aac',
             '-b:a', profile.height <= 480 ? '96k' : '128k', // Dynamic Audio Bitrate
             '-ac', '2',
             '-y', outputPath
-          ];
+          );
+
+          return args;
         };
 
         // --- TIER 2: ROBUST NVENC GPU ENGINE (SOFTWARE DECODE + NVENC HARDWARE ENCODE) ---
         // Penyelamat untuk Zoom, WebRTC, High 4:4:4, variable framerate, atau resolusi non-standar
-        const buildRobustNVENCArgs = (inputPath: string, outputPath: string, targetResName: string, srcW: number, srcH: number) => {
+        const buildRobustNVENCArgs = (inputPath: string, outputPath: string, targetResName: string) => {
           const profile = RESOLUTION_PROFILES[targetResName] || RESOLUTION_PROFILES['720p'];
-          const isVertical = srcH > srcW;
-          const scaleFilter = isVertical 
-            ? `scale=-2:${profile.height}:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p` 
-            : `scale=${profile.width}:-2:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p`;
+          const scaleFilter = buildSoftwareScaleFilter(profile);
 
-          return [
+          const args = [
             '-progress', 'pipe:1',
             '-nostats',
             '-fflags', '+genpts+discardcorrupt',
@@ -1157,29 +1471,34 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
             '-i', inputPath,
             '-vf', scaleFilter,
             '-c:v', 'h264_nvenc',
-            '-preset', 'p4',
+            '-preset', gpuProfile.recommendedPreset,
             '-rc', 'vbr',
             '-cq', profile.cq.toString(),
             '-b:v', profile.bitrate,
             '-maxrate', profile.maxrate,
             '-bufsize', profile.bufsize,
-            '-spatial_aq', '1',
-            '-temporal_aq', '1',
+            '-spatial_aq', '1'
+          ];
+
+          if (gpuProfile.supportsTemporalAQ) {
+            args.push('-temporal_aq', '1');
+          }
+
+          args.push(
             '-c:a', 'aac',
             '-b:a', profile.height <= 480 ? '96k' : '128k',
             '-ac', '2',
             '-y', outputPath
-          ];
+          );
+
+          return args;
         };
 
         // --- TIER 3: UNIVERSAL CPU SOFTWARE FALLBACK ENGINE (libx264) ---
         // Jaring pengaman mutlak jika GPU NVENC mengalami kendala driver/session limit
-        const buildCPUFallbackArgs = (inputPath: string, outputPath: string, targetResName: string, srcW: number, srcH: number) => {
+        const buildCPUFallbackArgs = (inputPath: string, outputPath: string, targetResName: string) => {
           const profile = RESOLUTION_PROFILES[targetResName] || RESOLUTION_PROFILES['720p'];
-          const isVertical = srcH > srcW;
-          const scaleFilter = isVertical 
-            ? `scale=-2:${profile.height}:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p` 
-            : `scale=${profile.width}:-2:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p`;
+          const scaleFilter = buildSoftwareScaleFilter(profile);
 
           return [
             '-progress', 'pipe:1',
@@ -1305,7 +1624,7 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
           if (!isSourceHardwareDecodeIncompatible) {
             try {
               console.log(`[PURE GPU VRAM 54.4] Memulai 100% Pure CUDA VRAM Transcoding untuk ID: ${uploadIdStr} (Res: ${targetResName})...`);
-              const tier1Args = buildPureGPUVRAMArgs(inputPath, outputPath, targetResName, sourceWidth, sourceHeight);
+              const tier1Args = buildPureGPUVRAMArgs(inputPath, outputPath, targetResName);
               await runFFmpegCommand('Pure CUDA VRAM', tier1Args, uploadIdStr);
               console.log(`[PURE GPU VRAM 54.4] Sub-pass resolution ${targetResName} completed for ID: ${uploadIdStr}`);
               return;
@@ -1322,7 +1641,7 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
           // 100% kompatibel dengan Zoom recordings, WebRTC, High 4:4:4, odd resolutions, dll.
           try {
             console.log(`[ROBUST GPU NVENC] Memulai Transcoding Robust NVENC untuk ID: ${uploadIdStr} (Res: ${targetResName})...`);
-            const tier2Args = buildRobustNVENCArgs(inputPath, outputPath, targetResName, sourceWidth, sourceHeight);
+            const tier2Args = buildRobustNVENCArgs(inputPath, outputPath, targetResName);
             await runFFmpegCommand('Robust NVENC GPU', tier2Args, uploadIdStr);
             console.log(`[ROBUST GPU NVENC] Sub-pass resolution ${targetResName} completed for ID: ${uploadIdStr}`);
             return;
@@ -1335,7 +1654,7 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
           // 3. Coba Tier 3: Universal Software Fallback (CPU libx264)
           // Jaring pengaman mutlak jika GPU NVENC mengalami masalah driver atau session limit
           console.log(`[CPU FALLBACK] Memulai Universal CPU libx264 Transcoding untuk ID: ${uploadIdStr} (Res: ${targetResName})...`);
-          const tier3Args = buildCPUFallbackArgs(inputPath, outputPath, targetResName, sourceWidth, sourceHeight);
+          const tier3Args = buildCPUFallbackArgs(inputPath, outputPath, targetResName);
           await runFFmpegCommand('Universal CPU libx264', tier3Args, uploadIdStr);
           console.log(`[CPU FALLBACK] Sub-pass resolution ${targetResName} completed for ID: ${uploadIdStr}`);
         };
@@ -1743,27 +2062,85 @@ app.get('/api/auth/me', authenticate, async (req: any, res) => {
   });
 
 // --- Studio & Video Management Routes ---
+/**
+ * Mengambil analitik seluruh video milik kreator secara agregat agar
+ * totalWatchTime, totalViews, dan statistik per video selalu konsisten.
+ */
+async function fetchCreatorVideoAnalytics(creatorId: number | string) {
+  const [videoRows]: any = await db.query(`
+    SELECT
+      v.id,
+      v.title,
+      v.thumbnail_url,
+      v.thumbnail,
+      v.duration,
+      v.created_at,
+      GREATEST(COALESCE(v.views, 0), COALESCE(vw.total_views, 0), COALESCE(vs.views, 0)) AS views,
+      GREATEST(COALESCE(v.watch_time, 0), COALESCE(va.total_duration, 0), COALESCE(vs.watch_time_seconds, 0)) AS watch_time,
+      COALESCE(lk.total_likes, 0) AS likes,
+      COALESCE(cm.total_comments, 0) AS comments
+    FROM Videos v
+    LEFT JOIN (
+      SELECT video_id, COUNT(id) AS total_views
+      FROM Views
+      GROUP BY video_id
+    ) vw ON vw.video_id = v.id
+    LEFT JOIN (
+      SELECT video_id, COALESCE(SUM(duration), 0) AS total_duration
+      FROM video_analytics
+      GROUP BY video_id
+    ) va ON va.video_id = v.id
+    LEFT JOIN video_stats vs ON vs.video_id = v.id
+    LEFT JOIN (
+      SELECT video_id, COUNT(id) AS total_likes
+      FROM Likes
+      WHERE type = 'like'
+      GROUP BY video_id
+    ) lk ON lk.video_id = v.id
+    LEFT JOIN (
+      SELECT video_id, COUNT(id) AS total_comments
+      FROM Comments
+      GROUP BY video_id
+    ) cm ON cm.video_id = v.id
+    WHERE v.user_id = ? AND v.deleted_at IS NULL
+    ORDER BY v.created_at DESC
+  `, [creatorId]);
+
+  const videos = (videoRows || []).map((v: any) => {
+    const watchTime = Number(v.watch_time) || 0;
+    return {
+      ...v,
+      views: Number(v.views) || 0,
+      watch_time: watchTime,
+      watch_time_seconds: watchTime,
+      likes: Number(v.likes) || 0,
+      comments: Number(v.comments) || 0
+    };
+  });
+
+  const totalWatchTime = videos.reduce((sum: number, v: any) => sum + v.watch_time, 0);
+  const totalViews = videos.reduce((sum: number, v: any) => sum + v.views, 0);
+  const totalLikes = videos.reduce((sum: number, v: any) => sum + v.likes, 0);
+  const totalComments = videos.reduce((sum: number, v: any) => sum + v.comments, 0);
+  const watchedVideosCount = videos.reduce((count: number, v: any) => count + (v.watch_time > 0 ? 1 : 0), 0);
+
+  return {
+    global: {
+      totalVideos: videos.length,
+      totalViews,
+      totalWatchTime,
+      totalLikes,
+      totalComments,
+      watchedVideosCount
+    },
+    videos
+  };
+}
+
 app.get('/api/analytics/creator-overview', authenticate, async (req: any, res) => {
   try {
-    const creatorId = req.user.id;
-    const [summary]: any = await db.query(`
-      SELECT 
-        COUNT(DISTINCT v.id) as totalVideos,
-        SUM(COALESCE(v.views, 0)) as totalViews,
-        SUM(COALESCE(va.watch_duration, 0)) as totalWatchTime
-      FROM Videos v
-      LEFT JOIN (
-        SELECT video_id, SUM(duration) as watch_duration 
-        FROM video_analytics GROUP BY video_id
-      ) va ON v.id = va.video_id
-      WHERE v.user_id = ?`, [creatorId]);
-    
-    // Format strictly to number
-    res.json({
-      totalVideos: Number(summary[0]?.totalVideos) || 0,
-      totalViews: Number(summary[0]?.totalViews) || 0,
-      totalWatchTime: Number(summary[0]?.totalWatchTime) || 0
-    });
+    const analytics = await fetchCreatorVideoAnalytics(req.user.id);
+    res.json(analytics.global);
   } catch (err) {
     console.error('Fetch creator overview error:', err);
     res.status(500).json({ error: 'Failed to fetch analytics' });
@@ -1775,10 +2152,17 @@ app.get('/api/studio/videos', authenticate, async (req: any, res) => {
   try {
     const [videos]: any = await db.execute(`
       SELECT v.*, 
-        GREATEST(COALESCE(v.views, 0), (SELECT COUNT(id) FROM Views WHERE video_id = v.id)) as views,
-        GREATEST(COALESCE(v.watch_time, 0), (SELECT COALESCE(SUM(duration), 0) FROM video_analytics WHERE video_id = v.id)) as watch_time 
-      FROM Videos v 
-      WHERE v.user_id = ? 
+        GREATEST(COALESCE(v.views, 0), COALESCE(vw.total_views, 0), COALESCE(vs.views, 0)) as views,
+        GREATEST(COALESCE(v.watch_time, 0), COALESCE(va.total_duration, 0), COALESCE(vs.watch_time_seconds, 0)) as watch_time 
+      FROM Videos v
+      LEFT JOIN (
+        SELECT video_id, COUNT(id) AS total_views FROM Views GROUP BY video_id
+      ) vw ON vw.video_id = v.id
+      LEFT JOIN (
+        SELECT video_id, COALESCE(SUM(duration), 0) AS total_duration FROM video_analytics GROUP BY video_id
+      ) va ON va.video_id = v.id
+      LEFT JOIN video_stats vs ON vs.video_id = v.id
+      WHERE v.user_id = ? AND v.deleted_at IS NULL
       ORDER BY v.created_at DESC
     `, [req.user.id]);
     
@@ -1802,7 +2186,7 @@ const queuedOrActiveVideos = new Set<number>();
 app.post('/api/videos/draft', authenticate, async (req: any, res) => {
   console.log('[API CALL] ' + req.originalUrl);
   try {
-    const { title, description, allowDownload, student_name, program_id, meeting_number, session_date } = req.body;
+    const { title, description, allowDownload, student_name, program_id, meeting_number, session_date, teacher_note, teacherNote } = req.body;
     
     // Helper sanitasi integer aman dari string 'undefined' / 'null' / NaN
     const parseSafeInt = (val: any): number | null => {
@@ -1814,6 +2198,7 @@ app.post('/api/videos/draft', authenticate, async (req: any, res) => {
     let safeProgramId = parseSafeInt(program_id);
     const safeMeetingNumber = parseSafeInt(meeting_number);
     const safeSessionDate = (session_date && session_date !== 'undefined' && session_date !== 'null') ? session_date : null;
+    const safeTeacherNote = (teacher_note || teacherNote || '').trim() || null;
 
     // Verifikasi keberadaan program_id di tabel Programs sebelum insert untuk cegah Foreign Key error
     if (safeProgramId !== null) {
@@ -1830,12 +2215,15 @@ app.post('/api/videos/draft', authenticate, async (req: any, res) => {
     );
     
     if (existing && existing.length > 0) {
+      if (safeTeacherNote) {
+        await db.execute('UPDATE Videos SET teacher_note = ? WHERE id = ?', [safeTeacherNote, existing[0].id]).catch(() => {});
+      }
       return res.json({ id: existing[0].id, uploadId: Date.now().toString() });
     }
 
     const uploadId = req.body.uploadId || Date.now().toString();
     const [result]: any = await db.execute(
-      'INSERT INTO Videos (user_id, title, description, status, allow_download, student_name, program_id, meeting_number, session_date, upload_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO Videos (user_id, title, description, status, allow_download, student_name, program_id, meeting_number, session_date, upload_id, teacher_note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [
         req.user.id, 
         title || 'Untitled', 
@@ -1846,7 +2234,8 @@ app.post('/api/videos/draft', authenticate, async (req: any, res) => {
         safeProgramId,
         safeMeetingNumber,
         safeSessionDate,
-        uploadId
+        uploadId,
+        safeTeacherNote
       ]
     );
     res.json({ id: result.insertId, uploadId });
@@ -1912,7 +2301,14 @@ app.post('/api/video/abort-processing', async (req, res) => {
   }
 
   try {
-    // 1. Matikan Child Process FFmpeg jika sedang berjalan
+    // 1. Hapus dari antrean transcode jika masih dalam status waiting
+    const queueIdx = transcodeQueue.findIndex(job => job.uploadId === uploadId);
+    if (queueIdx !== -1) {
+      const [removed] = transcodeQueue.splice(queueIdx, 1);
+      console.log(`[PROCESS KILLER] VideoID ${removed.videoId} (uploadId: ${uploadId}) berhasil dihapus dari antrean tunggu.`);
+    }
+
+    // 2. Matikan Child Process FFmpeg jika sedang berjalan
     if (activeFFmpegProcesses.has(uploadId)) {
       const proc = activeFFmpegProcesses.get(uploadId);
       try {
@@ -1924,9 +2320,12 @@ app.post('/api/video/abort-processing', async (req, res) => {
       activeFFmpegProcesses.delete(uploadId);
     }
 
-    // 2. Bersihkan Progress Map & Hapus Record MySQL jika ada
+    // 3. Bersihkan Progress Map & Hapus Record MySQL jika ada
     encodingProgressMap.delete(uploadId);
     await db.query('DELETE FROM Videos WHERE upload_id = ? OR title LIKE ?', [uploadId, `%${uploadId}%`]);
+
+    // 4. Memicu dispatcher agar slot GPU yang kosong segera memproses video berikutnya
+    setTimeout(() => dispatchNextTranscodeJobs(), 100);
 
     res.json({ success: true, message: `Proses ${uploadId} berhasil dihentikan paksa.` });
   } catch (err) {
@@ -2043,25 +2442,22 @@ app.post('/api/upload/chunk', authenticate, upload.single('chunk'), async (req: 
         
         io.emit('video-progress-' + videoId, { status: 'waiting' });
         
-        // Layer 4: P-Queue Deduplication
+        // Masukkan ke Fair-Share Multi-Tenant GPU Transcoding Scheduler
         const vidIdInt = parseInt(videoId);
-        if (!queuedOrActiveVideos.has(vidIdInt)) {
-          queuedOrActiveVideos.add(vidIdInt);
-          ffmpegTranscodeQueue.push(async () => {
-             try {
-                await processVideo(vidIdInt, omniPath, fileName, uploadId);
-             } finally {
-                queuedOrActiveVideos.delete(vidIdInt);
-             }
-          });
-          processNextInFFmpegQueue();
-        }
+        queueTranscodeJob({
+          videoId: vidIdInt,
+          userId: req.user?.id || 1,
+          inputPath: omniPath,
+          originalFilename: fileName,
+          uploadId: uploadId,
+          isObfuscated: true
+        });
 
         // Clear active merge lock
         activeMerges.delete(lockKey);
 
-        // INSTANTLY return response with accurate initial status
-        const initialStatus = (currentTranscodingVideoId === vidIdInt) ? 'processing' : 'waiting';
+        // INSTANTLY return response with accurate initial status (processing jika langsung dapat slot, waiting jika mengantre)
+        const initialStatus = activeTranscodingJobs.has(vidIdInt) ? 'processing' : 'waiting';
         return res.json({ status: initialStatus });
       });
       
@@ -2117,8 +2513,14 @@ app.post('/api/videos/upload', authenticate, upload.single('video'), async (req:
       // Pemicu Instan: Langsung lemparkan VideoID ke mesin multi-resolution encoding NVENC
       if (typeof processVideo === 'function') {
         const uploadId = req.body.uploadId;
-        ffmpegTranscodeQueue.push(() => processVideo(newVideoId, omniPath, req.file.originalname, uploadId));
-        processNextInFFmpegQueue();
+        queueTranscodeJob({
+          videoId: newVideoId,
+          userId: req.user?.id || 1,
+          inputPath: omniPath,
+          originalFilename: req.file.originalname,
+          uploadId: uploadId,
+          isObfuscated: true
+        });
       }
       
       // Kirim respons ke frontend bahwa antrean telah diterima dan sedang diproses di background
@@ -2516,13 +2918,77 @@ app.post('/api/videos/:id/view', optionalAuthenticate, async (req: any, res) => 
   }
 });
 
+const watchSessionBudgets = new Map<string, { lastAtMs: number; budgetSec: number }>();
+
+/**
+ * Membatasi penambahan watch time per sesi tontonan agar request ganda atau lonjakan
+ * tidak sinkron dari satu penonton tertahan tanpa mengganggu penonton lain yang bersamaan.
+ */
+function claimWatchSessionIncrement(sessionId: string | undefined, videoId: number, requestedSeconds: number): number {
+  const clamped = Math.min(Math.max(Math.round(requestedSeconds), 1), 30);
+  if (!sessionId || typeof sessionId !== 'string') {
+    return clamped;
+  }
+
+  const now = Date.now();
+  if (watchSessionBudgets.size > 5000) {
+    const staleBefore = now - 30 * 60 * 1000;
+    for (const [key, entry] of watchSessionBudgets.entries()) {
+      if (entry.lastAtMs < staleBefore) {
+        watchSessionBudgets.delete(key);
+      }
+    }
+  }
+
+  const key = `${sessionId.slice(0, 80)}:${videoId}`;
+  const existing = watchSessionBudgets.get(key);
+  if (!existing) {
+    const allowed = Math.min(clamped, 15);
+    watchSessionBudgets.set(key, { lastAtMs: now, budgetSec: 1 });
+    return allowed;
+  }
+
+  const elapsedSec = Math.max(0, (now - existing.lastAtMs) / 1000);
+  existing.lastAtMs = now;
+  existing.budgetSec = Math.min(15, existing.budgetSec + elapsedSec * 2);
+
+  const allowed = Math.min(clamped, Math.floor(existing.budgetSec));
+  if (allowed < 1) {
+    return 0;
+  }
+  existing.budgetSec -= allowed;
+  return allowed;
+}
+
 app.post('/api/videos/:id/heartbeat', optionalAuthenticate, async (req: any, res) => {
   try {
     const videoId = parseInt(req.params.id, 10);
     if (isNaN(videoId)) return res.status(400).json({ error: 'ID video tidak valid' });
 
-    const increment = 10; // 10 detik per heartbeat
+    const rawSeconds = req.body?.seconds ?? req.body?.duration;
+    if (rawSeconds === undefined || rawSeconds === null || rawSeconds === '') {
+      return res.json({ success: true, videoId, addedSeconds: 0 });
+    }
+
+    const parsedSeconds = Number(rawSeconds);
+    if (!Number.isFinite(parsedSeconds) || parsedSeconds <= 0) {
+      return res.json({ success: true, videoId, addedSeconds: 0 });
+    }
+
+    const increment = claimWatchSessionIncrement(req.body?.sessionId, videoId, parsedSeconds);
+    if (increment < 1) {
+      return res.json({ success: true, videoId, addedSeconds: 0, throttled: true });
+    }
     const userId = req.user?.id || null;
+
+    const [videoRows]: any = await db.query(
+      'SELECT id, user_id FROM Videos WHERE id = ? AND deleted_at IS NULL LIMIT 1',
+      [videoId]
+    );
+    if (!videoRows || videoRows.length === 0) {
+      return res.status(404).json({ error: 'Video tidak ditemukan' });
+    }
+    const videoOwnerId = videoRows[0].user_id;
 
     // 1. Akumulasi watch_time di tabel Videos
     await db.execute('UPDATE Videos SET watch_time = COALESCE(watch_time, 0) + ? WHERE id = ?', [increment, videoId]);
@@ -2530,7 +2996,7 @@ app.post('/api/videos/:id/heartbeat', optionalAuthenticate, async (req: any, res
     // 2. Akumulasi di video_stats
     try {
       await db.execute(
-        "INSERT INTO video_stats (video_id, watch_time_seconds) VALUES (?, ?) ON DUPLICATE KEY UPDATE watch_time_seconds = watch_time_seconds + ?",
+        "INSERT INTO video_stats (video_id, watch_time_seconds) VALUES (?, ?) ON DUPLICATE KEY UPDATE watch_time_seconds = COALESCE(watch_time_seconds, 0) + ?",
         [videoId, increment, increment]
       );
     } catch (e) { /* ignore */ }
@@ -2566,7 +3032,31 @@ app.post('/api/videos/:id/heartbeat', optionalAuthenticate, async (req: any, res
       }
     }
 
-    res.sendStatus(200);
+    const [latestRows]: any = await db.query(`
+      SELECT GREATEST(
+        COALESCE(v.watch_time, 0),
+        COALESCE((SELECT SUM(duration) FROM video_analytics WHERE video_id = v.id), 0),
+        COALESCE((SELECT watch_time_seconds FROM video_stats WHERE video_id = v.id), 0)
+      ) AS watch_time
+      FROM Videos v
+      WHERE v.id = ?
+    `, [videoId]);
+
+    const latestWatchTime = Number(latestRows?.[0]?.watch_time) || increment;
+
+    io.emit('video-watchtime-update', {
+      videoId,
+      creatorId: videoOwnerId,
+      watch_time: latestWatchTime,
+      addedSeconds: increment
+    });
+
+    res.json({
+      success: true,
+      videoId,
+      addedSeconds: increment,
+      watch_time: latestWatchTime
+    });
   } catch (error) {
     console.error('Heartbeat error:', error);
     res.status(500).json({ error: 'Failed to record heartbeat' });
@@ -2638,57 +3128,8 @@ app.delete('/api/history', authenticate, async (req: any, res) => {
 
 app.get('/api/creator/analytics', authenticate, async (req: any, res) => {
   try {
-    const creatorId = req.user.id;
-    
-    // Global stats: dihitung langsung dari data riil tabel Videos milik kreator ini
-    const [globalStats]: any = await db.query(`
-      SELECT 
-        COUNT(v.id) as totalVideos,
-        COALESCE(SUM(GREATEST(COALESCE(v.views, 0), COALESCE((SELECT COUNT(id) FROM Views WHERE video_id = v.id), 0))), 0) as totalViews,
-        COALESCE(SUM(GREATEST(COALESCE(v.watch_time, 0), COALESCE((SELECT SUM(duration) FROM video_analytics WHERE video_id = v.id), 0))), 0) as totalWatchTime,
-        (SELECT COUNT(*) FROM Likes l JOIN Videos v2 ON l.video_id = v2.id WHERE v2.user_id = ? AND l.type = 'like') as totalLikes,
-        (SELECT COUNT(*) FROM Comments c JOIN Videos v3 ON c.video_id = v3.id WHERE v3.user_id = ?) as totalComments
-      FROM Videos v
-      WHERE v.user_id = ? AND v.deleted_at IS NULL
-    `, [creatorId, creatorId, creatorId]);
-
-    // Per-video stats
-    const [videoStats]: any = await db.query(`
-      SELECT 
-        v.id, 
-        v.title, 
-        v.thumbnail_url,
-        v.thumbnail,
-        v.duration,
-        v.created_at,
-        GREATEST(COALESCE(v.views, 0), COALESCE((SELECT COUNT(id) FROM Views WHERE video_id = v.id), 0)) as views,
-        GREATEST(COALESCE(v.watch_time, 0), COALESCE((SELECT SUM(duration) FROM video_analytics WHERE video_id = v.id), 0)) as watch_time,
-        (SELECT COUNT(*) FROM Likes WHERE video_id = v.id AND type = 'like') as likes,
-        (SELECT COUNT(*) FROM Comments WHERE video_id = v.id) as comments
-      FROM Videos v
-      WHERE v.user_id = ? AND v.deleted_at IS NULL
-      ORDER BY v.created_at DESC
-    `, [creatorId]);
-
-    const formattedVideos = videoStats.map((v: any) => ({
-      ...v,
-      views: Number(v.views) || 0,
-      watch_time: Number(v.watch_time) || 0,
-      watch_time_seconds: Number(v.watch_time) || 0,
-      likes: Number(v.likes) || 0,
-      comments: Number(v.comments) || 0
-    }));
-
-    res.json({
-      global: {
-        totalVideos: Number(globalStats[0]?.totalVideos) || 0,
-        totalViews: Number(globalStats[0]?.totalViews) || 0,
-        totalWatchTime: Number(globalStats[0]?.totalWatchTime) || 0,
-        totalLikes: Number(globalStats[0]?.totalLikes) || 0,
-        totalComments: Number(globalStats[0]?.totalComments) || 0
-      },
-      videos: formattedVideos
-    });
+    const analytics = await fetchCreatorVideoAnalytics(req.user.id);
+    res.json(analytics);
   } catch (error) {
     console.error('Fetch creator analytics error:', error);
     res.status(500).json({ error: 'Failed to fetch creator analytics' });
@@ -2866,12 +3307,22 @@ app.get('/api/videos/:id/analytics', authenticate, async (req: any, res) => {
     
     if (videos.length === 0) return res.status(403).json({ error: 'Access Denied' });
     
-    // Get total stats
+    // Get total stats (konsisten dengan creator analytics)
     const [stats]: any = await db.execute(`
       SELECT 
-        (SELECT COUNT(id) FROM Views WHERE video_id = ?) as total_views,
-        (SELECT COALESCE(SUM(duration), 0) FROM video_analytics WHERE video_id = ?) as total_watch_time
-    `, [videoId, videoId]);
+        GREATEST(
+          COALESCE(v.views, 0),
+          (SELECT COUNT(id) FROM Views WHERE video_id = v.id),
+          COALESCE((SELECT views FROM video_stats WHERE video_id = v.id), 0)
+        ) as total_views,
+        GREATEST(
+          COALESCE(v.watch_time, 0),
+          (SELECT COALESCE(SUM(duration), 0) FROM video_analytics WHERE video_id = v.id),
+          COALESCE((SELECT watch_time_seconds FROM video_stats WHERE video_id = v.id), 0)
+        ) as total_watch_time
+      FROM Videos v
+      WHERE v.id = ?
+    `, [videoId]);
 
     // Format stats with strict number safety
     const safeTotalViews = Number(stats[0]?.total_views) || 0;
@@ -2910,7 +3361,12 @@ app.get('/api/videos/:id/analytics', authenticate, async (req: any, res) => {
 app.get('/api/stats/video/:id', async (req, res) => {
   try {
     const [rows]: any = await db.query(
-      "SELECT COALESCE(SUM(duration), 0) as totalTime FROM video_analytics WHERE video_id = ?",
+      `SELECT GREATEST(
+        COALESCE(v.watch_time, 0),
+        COALESCE((SELECT SUM(duration) FROM video_analytics WHERE video_id = v.id), 0),
+        COALESCE((SELECT watch_time_seconds FROM video_stats WHERE video_id = v.id), 0)
+      ) as totalTime
+      FROM Videos v WHERE v.id = ?`,
       [req.params.id]
     );
     res.json({ watchTime: Number(rows[0]?.totalTime || 0) });
@@ -3115,27 +3571,137 @@ app.get('/api/admin/stats', authenticate, isAdmin, async (req, res) => {
   try {
     const [userCount]: any = await db.query('SELECT COUNT(*) as total FROM Users');
     const [videoCount]: any = await db.query('SELECT COUNT(*) as total FROM Videos');
-    const [viewsCount]: any = await db.query('SELECT SUM(views) as total FROM Videos');
-    
+    const [viewsCount]: any = await db.query('SELECT COALESCE(SUM(views), 0) as total FROM Videos');
+
+    // Recent 7-day counts for trends
+    const [recentUsers]: any = await db.query('SELECT COUNT(*) as total FROM Users WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)');
+    const [recentVideos]: any = await db.query('SELECT COUNT(*) as total FROM Videos WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)');
+    const [recentViews]: any = await db.query('SELECT COUNT(*) as total FROM Views WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)');
+
+    const totalUsers = userCount[0]?.total || 0;
+    const totalVideos = videoCount[0]?.total || 0;
+    const totalViews = Number(viewsCount[0]?.total) || 0;
+
+    const userTrend = totalUsers > 0 ? Math.round(((recentUsers[0]?.total || 0) / Math.max(1, totalUsers)) * 100) : 0;
+    const videoTrend = totalVideos > 0 ? Math.round(((recentVideos[0]?.total || 0) / Math.max(1, totalVideos)) * 100) : 0;
+    const viewsTrend = totalViews > 0 ? Math.round(((recentViews[0]?.total || 0) / Math.max(1, totalViews)) * 100) : 0;
+
+    // Daily views for the last 14 days (descending order, so frontend's .reverse() sorts past-to-present)
+    const [viewsRows]: any = await db.query(`
+      SELECT DATE(created_at) as dayDate, COUNT(*) as count 
+      FROM Views 
+      WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 14 DAY) 
+      GROUP BY DATE(created_at)
+    `);
+
+    const viewsMap = new Map<string, number>();
+    for (const r of viewsRows) {
+      if (r.dayDate) {
+        const dStr = new Date(r.dayDate).toISOString().split('T')[0];
+        viewsMap.set(dStr, Number(r.count) || 0);
+      }
+    }
+
+    const viewsByDay: { date: string; count: number }[] = [];
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    for (let i = 0; i < 14; i++) {
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      const isoDate = d.toISOString().split('T')[0];
+      const label = `${String(d.getDate()).padStart(2, '0')} ${months[d.getMonth()]}`;
+      viewsByDay.push({
+        date: label,
+        count: viewsMap.get(isoDate) || 0
+      });
+    }
+
+    // Top performing videos
+    const [topRows]: any = await db.query(`
+      SELECT id, title, views, status, thumbnail, thumbnail_url, file_path 
+      FROM Videos 
+      ORDER BY views DESC, id DESC 
+      LIMIT 5
+    `);
+
+    const topVideos = topRows.map((v: any) => {
+      let size = 24.5 * 1024 * 1024;
+      if (v.file_path && fs.existsSync(v.file_path)) {
+        try { size = fs.statSync(v.file_path).size; } catch {}
+      }
+      return {
+        id: v.id,
+        title: v.title,
+        views: v.views || 0,
+        thumbnail_url: v.thumbnail_url || (v.thumbnail ? `/thumbnails/${v.thumbnail}` : null),
+        size,
+        encoding_engine: hasNVENC ? 'gpu' : 'cpu',
+        status: v.status || 'ready'
+      };
+    });
+
     res.json({
-      totalUsers: userCount[0]?.total || 0,
-      totalVideos: videoCount[0]?.total || 0,
-      totalViews: viewsCount[0]?.total || 0,
+      totalUsers: { count: totalUsers, trend: userTrend },
+      totalVideos: { count: totalVideos, trend: videoTrend },
+      totalViews: { count: totalViews, trend: viewsTrend },
+      resources: {
+        cpu: getCpuUsagePercent(),
+        memory: getMemoryUsagePercent(),
+        hasNVENC: hasNVENC
+      },
+      viewsByDay,
+      topVideos,
       storageUsedGB: "12.4 GB",
       systemStatus: "Healthy",
-      activeTranscodes: ffmpegTranscodeQueue.length
+      activeTranscodes: activeTranscodingJobs.size + transcodeQueue.length
     });
   } catch (error) {
+    console.error('Failed to fetch admin stats:', error);
     res.status(500).json({ error: 'Failed to fetch admin stats' });
   }
 });
 
 app.get('/api/admin/queue', authenticate, isAdmin, async (req, res) => {
   try {
-    const [processingVideos]: any = await db.query(
-      "SELECT id, title, status, created_at FROM Videos WHERE status IN ('processing', 'waiting') ORDER BY created_at DESC"
-    );
-    res.json(processingVideos);
+    const processing: any[] = [];
+    const waiting: any[] = [];
+
+    for (const [vidId, job] of activeTranscodingJobs.entries()) {
+      const progress = encodingProgressMap.get(String(job.uploadId)) || encodingProgressMap.get(String(vidId)) || 0;
+      processing.push({
+        id: vidId,
+        title: (job as any).title || job.originalFilename || `Video #${vidId}`,
+        progress,
+        status: 'processing'
+      });
+    }
+
+    for (const job of transcodeQueue) {
+      waiting.push({
+        id: job.videoId,
+        title: (job as any).title || job.originalFilename || `Video #${job.videoId}`,
+        progress: 0,
+        status: 'waiting'
+      });
+    }
+
+    if (processing.length === 0 && waiting.length === 0) {
+      const [dbQueue]: any = await db.query(
+        "SELECT id, title, status FROM Videos WHERE status IN ('processing', 'waiting') ORDER BY created_at DESC LIMIT 20"
+      );
+      for (const v of dbQueue) {
+        if (v.status === 'processing') {
+          processing.push({ id: v.id, title: v.title, progress: 50, status: 'processing' });
+        } else {
+          waiting.push({ id: v.id, title: v.title, progress: 0, status: 'waiting' });
+        }
+      }
+    }
+
+    res.json({
+      pending: processing.length + waiting.length,
+      processing,
+      waiting
+    });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch queue' });
   }
@@ -3150,11 +3716,43 @@ app.post('/api/admin/restart', authenticate, isAdmin, async (req, res) => {
 
 app.get('/api/admin/settings', authenticate, isAdmin, async (req, res) => {
   try {
-    res.json(encodingSettings);
+    const settingsList = [
+      { setting_key: 'max_upload_size_mb', setting_value: String((encodingSettings.maxUploadSizeGB || 5) * 1024) },
+      { setting_key: 'encoding_engine', setting_value: encodingSettings.engine || (hasNVENC ? 'gpu' : 'cpu') }
+    ];
+    res.json(settingsList);
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch settings' });
   }
 });
+
+const saveSettingsHandler = async (req: any, res: any) => {
+  try {
+    const { settings } = req.body;
+    if (Array.isArray(settings)) {
+      for (const s of settings) {
+        const key = s.key || s.setting_key;
+        const val = s.value ?? s.setting_value;
+        if (key === 'max_upload_size_mb') {
+          const mb = parseInt(val, 10);
+          if (!isNaN(mb) && mb > 0) {
+            encodingSettings.maxUploadSizeGB = Math.round(mb / 1024) || 1;
+          }
+        }
+        if (key === 'encoding_engine') {
+          encodingSettings.engine = val;
+        }
+      }
+      fs.writeFileSync(ENCODING_SETTINGS_FILE, JSON.stringify(encodingSettings, null, 2));
+    }
+    res.json({ success: true, settings: encodingSettings });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to save settings' });
+  }
+};
+
+app.post('/api/admin/settings', authenticate, isAdmin, saveSettingsHandler);
+app.put('/api/admin/settings', authenticate, isAdmin, saveSettingsHandler);
 
 app.get('/api/admin/comments', authenticate, isAdmin, async (req, res) => {
   try {
@@ -3176,11 +3774,43 @@ app.get('/api/admin/users', authenticate, isAdmin, async (req, res) => {
     const [users]: any = await db.query('SELECT id, email, firstName, lastName, role, created_at FROM Users ORDER BY created_at DESC');
     const mappedUsers = users.map((u: any) => ({
       ...u,
+      first_name: u.firstName,
+      last_name: u.lastName,
       is_blocked: disabledUsers.includes(u.id)
     }));
     res.json(mappedUsers);
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch users' });
+  }
+});
+
+app.get('/api/admin/users/:id/details', authenticate, isAdmin, async (req: any, res) => {
+  try {
+    const userId = parseInt(req.params.id);
+    const [users]: any = await db.query('SELECT id, email, firstName, lastName, role, created_at FROM Users WHERE id = ?', [userId]);
+    if (users.length === 0) return res.status(404).json({ error: 'User not found' });
+    const user = users[0];
+
+    const [videoStats]: any = await db.query('SELECT COUNT(*) as total_videos, COALESCE(SUM(views), 0) as total_views FROM Videos WHERE user_id = ?', [userId]);
+    const totalVideos = videoStats[0]?.total_videos || 0;
+    const totalViews = videoStats[0]?.total_views || 0;
+
+    res.json({
+      id: user.id,
+      email: user.email,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      first_name: user.firstName,
+      last_name: user.lastName,
+      role: user.role,
+      is_blocked: disabledUsers.includes(user.id),
+      total_videos: totalVideos,
+      total_views: totalViews,
+      total_storage: totalVideos * 15 * 1024 * 1024,
+      created_at: user.created_at
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch user details' });
   }
 });
 
@@ -3353,7 +3983,7 @@ app.post('/api/admin/users', authenticate, isAdmin, async (req, res) => {
   }
 });
 
-app.put('/api/admin/users/:id/password', authenticate, isAdmin, async (req: any, res) => {
+const updateUserPasswordHandler = async (req: any, res: any) => {
   try {
     const userId = parseInt(req.params.id);
     const { newPassword } = req.body;
@@ -3367,12 +3997,15 @@ app.put('/api/admin/users/:id/password', authenticate, isAdmin, async (req: any,
     console.error('Update user password error:', error);
     res.status(500).json({ error: 'Failed to update user password' });
   }
-});
+};
+app.put('/api/admin/users/:id/password', authenticate, isAdmin, updateUserPasswordHandler);
+app.post('/api/admin/users/:id/password', authenticate, isAdmin, updateUserPasswordHandler);
 
-app.put('/api/admin/users/:id', authenticate, isAdmin, async (req: any, res) => {
+const updateUserHandler = async (req: any, res: any) => {
   try {
     const userId = parseInt(req.params.id);
-    const { role, firstName, lastName, is_blocked, password } = req.body;
+    const { role, firstName, lastName, password } = req.body;
+    const is_blocked = typeof req.body.is_blocked === 'boolean' ? req.body.is_blocked : req.body.isBlocked;
 
     if (role || firstName || lastName) {
       await db.execute('UPDATE Users SET role = COALESCE(?, role), firstName = COALESCE(?, firstName), lastName = COALESCE(?, lastName) WHERE id = ?', 
@@ -3398,7 +4031,9 @@ app.put('/api/admin/users/:id', authenticate, isAdmin, async (req: any, res) => 
     console.error('Update user error:', error);
     res.status(500).json({ error: 'Failed to update user' });
   }
-});
+};
+app.put('/api/admin/users/:id', authenticate, isAdmin, updateUserHandler);
+app.post('/api/admin/users/:id', authenticate, isAdmin, updateUserHandler);
 
 app.delete('/api/admin/users/:id', authenticate, isAdmin, async (req: any, res) => {
   try {
@@ -3736,6 +4371,51 @@ app.get('/api/videos/download/:id/:res', authenticateDownload, async (req: any, 
 });
 
 // ============================================================================
+// DYNAMIC PORT DETECTOR & CONFLICT RESOLVER
+// ============================================================================
+function isPortAvailable(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const tester = net.createServer();
+    tester.once('error', () => {
+      resolve(false);
+    });
+    tester.once('listening', () => {
+      tester.once('close', () => {
+        // Double-check interface 127.0.0.1 untuk memastikan tidak ada process stealth pada Windows
+        const testerLoopback = net.createServer();
+        testerLoopback.once('error', () => {
+          resolve(false);
+        });
+        testerLoopback.once('listening', () => {
+          testerLoopback.once('close', () => {
+            resolve(true);
+          }).close();
+        });
+        testerLoopback.listen(port, '127.0.0.1');
+      }).close();
+    });
+    tester.listen(port, '0.0.0.0');
+  });
+}
+
+async function findAvailablePort(startPort: number, label: string, maxTries = 50): Promise<number> {
+  let port = startPort;
+  for (let i = 0; i < maxTries; i++) {
+    const available = await isPortAvailable(port);
+    if (available) {
+      if (port !== startPort) {
+        console.warn(`[PORT CONFLICT] ⚠️ Port ${startPort} (${label}) sudah digunakan service/aplikasi lain! Otomatis dialihkan ke port: ${port}`);
+      } else {
+        console.log(`[PORT RESOLVER] ✅ Port ${port} (${label}) siap dan bebas digunakan.`);
+      }
+      return port;
+    }
+    port++;
+  }
+  throw new Error(`Tidak menemukan port bebas untuk ${label} dalam rentang ${startPort} - ${startPort + maxTries}`);
+}
+
+// ============================================================================
 // 8. VITE MIDDLEWARE & SERVER START
 // ============================================================================
 async function startServer() {
@@ -3823,7 +4503,7 @@ async function startServer() {
         console.error('[DATABASE SETUP ERROR]:', err?.message || err);
       }
     };
-    runDBSetup();
+    await runDBSetup();
 
     // --- API ENDPOINT FETCH PROGRAMS (TAHAP 61.0) ---
     app.get('/api/programs', async (req, res) => {
@@ -3894,6 +4574,7 @@ async function startServer() {
         CREATE TABLE IF NOT EXISTS video_stats (
           video_id INT PRIMARY KEY,
           views INT DEFAULT 0,
+          watch_time_seconds INT DEFAULT 0,
           FOREIGN KEY (video_id) REFERENCES Videos(id) ON DELETE CASCADE
         )
       `);
@@ -3937,10 +4618,12 @@ async function startServer() {
         CREATE TABLE IF NOT EXISTS video_stats (
           video_id INT PRIMARY KEY,
           views INT DEFAULT 0,
+          watch_time_seconds INT DEFAULT 0,
           FOREIGN KEY (video_id) REFERENCES Videos(id) ON DELETE CASCADE
         )
       `);
     } catch (e: any) {}
+    try { await db.query("ALTER TABLE video_stats ADD COLUMN watch_time_seconds INT DEFAULT 0"); } catch (e: any) {}
     try {
       await db.query(`
         CREATE TABLE IF NOT EXISTS Subscriptions (
@@ -4164,7 +4847,11 @@ async function startServer() {
 
     res.json({
       isLive: isStreamActive,
-      rtmpUrl: `rtmp://${serverHost}:1935/live`,
+      rtmpUrl: `rtmp://${serverHost}:${currentRtmpPort}/live`,
+      hlsUrl: `http://${serverHost}:${currentNmsHttpPort}/live/${currentStreamKey || `stream_key_user_${currentUserId}`}/index.m3u8`,
+      nmsHttpPort: currentNmsHttpPort,
+      rtmpPort: currentRtmpPort,
+      appPort: currentAppPort,
       streamKey: currentStreamKey || `stream_key_user_${currentUserId}`,
       title: currentLiveConfig.title,
       description: currentLiveConfig.description,
@@ -4269,16 +4956,22 @@ async function startServer() {
     fs.mkdirSync(recordingsPath, { recursive: true });
   }
 
+  // Cek & alokasikan port bebas untuk RTMP Ingest & NodeMediaServer HTTP Panel
+  const desiredRtmpPort = Number(process.env.RTMP_PORT) || 1935;
+  const desiredNmsHttpPort = Number(process.env.NMS_HTTP_PORT) || 8005;
+  currentRtmpPort = await findAvailablePort(desiredRtmpPort, 'RTMP Live Ingest');
+  currentNmsHttpPort = await findAvailablePort(desiredNmsHttpPort, 'NodeMediaServer HTTP');
+
   const rtmpConfig = {
     rtmp: {
-      port: 1935,
+      port: currentRtmpPort,
       chunk_size: 60000,
       gop_cache: true,
       ping: 30,
       ping_timeout: 60
     },
     http: {
-      port: 8005, // Port panel internal NMS agar tidak bentrok dengan Express port 3000
+      port: currentNmsHttpPort, // Port panel internal NMS agar tidak bentrok dengan Express
       allow_origin: '*',
       mediaroot: path.join(__dirname, 'public')
     },
@@ -4298,7 +4991,7 @@ async function startServer() {
           dash: false,
           vcParam: [
             '-c:v', 'h264_nvenc',
-            '-preset', 'p4',
+            '-preset', gpuProfile.recommendedPreset,
             '-rc:v', 'vbr',
             '-cq:v', '23',
             '-spatial-aq', '1',
@@ -4409,9 +5102,14 @@ async function startServer() {
       io.emit('video-progress-' + targetVideoId, { status: 'processing', progress: 0 });
 
       console.log(`[LIVE AUTO-ARCHIVE] Memasukkan Video ID ${targetVideoId} ke antrean FFmpeg Multi-Resolution Encoding...`);
-      // Masukkan ke antrean transcoding FFmpeg GPU (isObfuscated = false karena file FLV asli)
-      ffmpegTranscodeQueue.push(() => processVideo(targetVideoId, recordedFilePath, `live_record_${streamName}.flv`, undefined, false));
-      processNextInFFmpegQueue();
+      // Masukkan ke antrean transcoding FFmpeg GPU Fair-Share (isObfuscated = false karena file FLV asli)
+      queueTranscodeJob({
+        videoId: targetVideoId,
+        userId: currentLiveConfig?.userId || 1,
+        inputPath: recordedFilePath,
+        originalFilename: `live_record_${streamName}.flv`,
+        isObfuscated: false
+      });
     } catch (err) {
       console.error('[LIVE AUTO-ARCHIVE ERROR] Gagal memproses rekaman siaran langsung:', err);
     }
@@ -4424,29 +5122,46 @@ async function startServer() {
   const recoverUnfinishedQueue = async () => {
     try {
       const [pendingVideos]: any = await db.query(
-        "SELECT id, url, title, upload_id FROM Videos WHERE status IN ('waiting', 'processing')"
+        "SELECT id, user_id, url, title, upload_id FROM Videos WHERE status IN ('waiting', 'processing')"
       );
       if (pendingVideos && pendingVideos.length > 0) {
-        console.log(`[RECOVERY] Menemukan ${pendingVideos.length} video belum selesai. Memasukkan kembali ke antrean...`);
+        console.log(`[RECOVERY] Menemukan ${pendingVideos.length} video belum selesai. Memasukkan kembali ke antrean Fair-Share...`);
         for (const vid of pendingVideos) {
           const fileName = vid.url ? path.basename(vid.url) : `${vid.upload_id}_${vid.title}`;
           const targetPath = path.join(UPLOAD_DIR, fileName);
           if (fs.existsSync(targetPath)) {
-            ffmpegTranscodeQueue.push(() => processVideo(vid.id, targetPath, vid.title, vid.upload_id));
+            queueTranscodeJob({
+              videoId: vid.id,
+              userId: vid.user_id || 1,
+              inputPath: targetPath,
+              originalFilename: vid.title,
+              uploadId: vid.upload_id,
+              isObfuscated: true
+            });
           }
         }
-        processNextInFFmpegQueue();
       }
     } catch (err) {
       console.error('[RECOVERY ERROR] Gagal memulihkan antrean video dari database:', err);
     }
   };
 
-  const PORT = Number(process.env.APP_PORT) || 3000;
-  server.listen(PORT, '0.0.0.0', async () => {
+  // Cek ketersediaan port untuk OmniHub (HTTP, Vite Frontend, & Socket.IO)
+  const desiredAppPort = Number(process.env.APP_PORT) || Number(process.env.PORT) || 3000;
+  currentAppPort = await findAvailablePort(desiredAppPort, 'OmniHub HTTP & Socket.IO');
+
+  server.listen(currentAppPort, '0.0.0.0', async () => {
     // Mulai render UI Terminal
     initDashboard();
-    console.log(`[SYSTEM] Server OmniHub berjalan di port ${PORT}`);
+    console.log(`[SYSTEM] 🚀 Server OmniHub berhasil aktif di port: ${currentAppPort}`);
+    if (currentAppPort !== desiredAppPort) {
+      console.log(`[PORT ALERT] ⚠️ Port default (${desiredAppPort}) sedang digunakan service lain.`);
+      console.log(`[PORT ALERT] 👉 OmniHub dialihkan dan dapat diakses di: http://localhost:${currentAppPort}`);
+    } else {
+      console.log(`[SYSTEM] 👉 Akses web: http://localhost:${currentAppPort}`);
+    }
+    console.log(`[SYSTEM] 📡 RTMP Stream Ingest: rtmp://localhost:${currentRtmpPort}/live`);
+    console.log(`[SYSTEM] 🌐 NMS HTTP Stream: http://localhost:${currentNmsHttpPort}`);
     await recoverUnfinishedQueue();
   });
 }

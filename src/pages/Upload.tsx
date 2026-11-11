@@ -53,7 +53,12 @@ export default function UploadPage() {
         description: f.description,
         visibility: f.visibility,
         categoryId: f.categoryId,
-        allowDownload: f.allowDownload
+        allowDownload: f.allowDownload,
+        studentName: f.studentName,
+        programId: f.programId,
+        meetingNumber: f.meetingNumber,
+        sessionDate: f.sessionDate,
+        teacherNote: f.teacherNote
       }));
       localStorage.setItem('omnihub_upload_draft', JSON.stringify(drafts));
     }
@@ -128,10 +133,11 @@ const generateLocalVideoThumbnail = (file: File): Promise<string> => {
           sizeFormatted: (file.size / (1024 * 1024)).toFixed(1) + ' MB',
           localPreviewUrl: localPreviewUrl,
           thumbnailUrl: generatedThumb || localPreviewUrl,
-          studentName: '',
-          programId: '',
-          meetingNumber: '',
-          sessionDate: new Date().toISOString().split('T')[0]
+          studentName: draft.studentName || '',
+          programId: draft.programId || '',
+          meetingNumber: draft.meetingNumber || '',
+          sessionDate: draft.sessionDate || new Date().toISOString().split('T')[0],
+          teacherNote: draft.teacherNote || ''
         };
       })
     );
@@ -151,7 +157,8 @@ const generateLocalVideoThumbnail = (file: File): Promise<string> => {
       studentName: '',
       programId: '',
       meetingNumber: '',
-      sessionDate: new Date().toISOString().split('T')[0]
+      sessionDate: new Date().toISOString().split('T')[0],
+      teacherNote: ''
     };
     setFiles(prev => [...prev, newFile]);
   };
@@ -292,6 +299,7 @@ const updateTaskProgress = (taskId: string, patch: Partial<any>) => {
           program_id: (fileObj.programId || '').toString(),
           meeting_number: (fileObj.meetingNumber || '').toString(),
           session_date: fileObj.sessionDate || new Date().toISOString().split('T')[0],
+          teacher_note: (fileObj.teacherNote || '').trim(),
           uploadId: uploadId
         })
       });
@@ -556,6 +564,24 @@ const updateTaskProgress = (taskId: string, patch: Partial<any>) => {
                           value={fileObj.sessionDate || new Date().toISOString().split('T')[0]}
                           onChange={(e) => updateFileData(fileObj.id, { sessionDate: e.target.value })}
                           className="w-full bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-2xl p-4 text-sm font-bold focus:outline-none focus:border-brand-600 transition-all"
+                        />
+                      </div>
+
+                      <div className="md:col-span-2">
+                        <div className="flex items-center justify-between mb-2">
+                          <label className="block text-[10px] font-black uppercase tracking-widest text-neutral-400">
+                            Catatan Tambahan / Note Pengajar <span className="text-neutral-400 font-normal">(Opsional)</span>
+                          </label>
+                          <span className="text-[10px] font-bold text-brand-600 dark:text-brand-400 flex items-center gap-1">
+                            ✨ AI akan menyertakan catatan ini ke dalam Weekly Report
+                          </span>
+                        </div>
+                        <textarea
+                          rows={2}
+                          value={fileObj.teacherNote || ''}
+                          onChange={(e) => updateFileData(fileObj.id, { teacherNote: e.target.value })}
+                          placeholder="Tuliskan catatan khusus untuk siswa ini (misal: Ananda sangat antusias belajar, aktif bertanya, dan mandiri menyelesaikan tantangan)..."
+                          className="w-full bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-2xl p-4 text-sm font-medium focus:outline-none focus:border-brand-600 transition-all resize-none text-neutral-900 dark:text-white placeholder:text-neutral-400 dark:placeholder:text-neutral-600"
                         />
                       </div>
                     </div>

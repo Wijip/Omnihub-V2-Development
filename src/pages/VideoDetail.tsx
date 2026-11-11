@@ -11,6 +11,7 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import { RelatedVideoSkeleton } from '../components/Skeleton';
 import { cn, formatDuration } from '../lib/utils';
+import { createWatchTimeTracker } from '../lib/watchTimeTracker';
 
 const API_BASE_URL = (import.meta as any).env?.VITE_API_URL?.replace(/\/api\/?$/, '') || '';
 
@@ -83,9 +84,15 @@ export default function VideoDetailPage() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const pendingTimeRef = useRef<number | null>(null);
   const pendingPlayStateRef = useRef<boolean>(false);
+  const [isVertical, setIsVertical] = useState(false);
 
   const handleLoadedMetadata = () => {
     if (videoRef.current) {
+      const { videoWidth, videoHeight } = videoRef.current;
+      if (videoHeight > 0 && videoWidth > 0) {
+        setIsVertical(videoHeight > videoWidth);
+      }
+
       if (pendingTimeRef.current !== null) {
         videoRef.current.currentTime = pendingTimeRef.current;
         if (pendingPlayStateRef.current) {
@@ -98,6 +105,7 @@ export default function VideoDetailPage() {
   };
 
   useEffect(() => {
+    setIsVertical(false);
     if (id && hasIncremented.current !== id) {
       hasIncremented.current = id;
       api.post(`/videos/${id}/view`)
@@ -111,35 +119,136 @@ export default function VideoDetailPage() {
   }, [id]);
 
   useEffect(() => {
-    let interval: NodeJS.Timeout;
+    if (loading || error || !id || !video?.id || String(video.id) !== String(id)) return;
     const videoElement = videoRef.current;
-    
-    const startHeartbeat = () => {
-      interval = setInterval(() => {
-         api.post(`/videos/${id}/heartbeat`).catch(console.error);
-      }, 10000);
+    if (!videoElement) return;
+
+    const targetVideoId = id;
+    const apiBase = ((import.meta as any).env?.VITE_API_URL || '/api').replace(/\/$/, '');
+    const heartbeatUrl = `${apiBase}/videos/${targetVideoId}/heartbeat`;
+    const sessionId =
+      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    const isActivelyPlaying = () =>
+      !videoElement.paused &&
+      !videoElement.ended &&
+      !videoElement.seeking &&
+      videoElement.readyState >= 2 &&
+      document.visibilityState !== 'hidden';
+
+    const tracker = createWatchTimeTracker((seconds, useKeepalive) => {
+      const payload = {
+        seconds,
+        sessionId,
+        currentTime: Number((videoElement.currentTime || 0).toFixed(2)),
+        videoDuration: Number((videoElement.duration || 0).toFixed(2)),
+      };
+
+      if (useKeepalive && typeof fetch === 'function') {
+        const token = localStorage.getItem('token') || localStorage.getItem('omnihub_token');
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (token && token !== 'undefined' && token !== 'null') {
+          headers.Authorization = `Bearer ${token}`;
+        }
+        fetch(heartbeatUrl, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(payload),
+          keepalive: true,
+        }).catch(() => {});
+        return;
+      }
+
+      api.post(`/videos/${targetVideoId}/heartbeat`, payload).catch((err) => {
+        if (!err?.response || err.response.status >= 500) {
+          tracker.restore(seconds);
+        }
+        console.error('Watch time heartbeat error:', err);
+      });
+    });
+
+    const sampleProgress = () => {
+      tracker.recordProgress({
+        currentTime: videoElement.currentTime,
+        playing: isActivelyPlaying(),
+        seeking: videoElement.seeking,
+        playbackRate: videoElement.playbackRate,
+      });
     };
 
-    const stopHeartbeat = () => {
-      if (interval) clearInterval(interval);
+    const handlePlaying = () => {
+      tracker.endSeeking(videoElement.currentTime, isActivelyPlaying());
+    };
+    const handleSeeking = () => {
+      tracker.beginSeeking();
+    };
+    const handleSeeked = () => {
+      tracker.endSeeking(videoElement.currentTime, isActivelyPlaying());
+    };
+    const handleBuffering = () => {
+      tracker.stopAt(videoElement.currentTime, videoElement.playbackRate);
+    };
+    const handlePause = () => {
+      tracker.stopAt(videoElement.currentTime, videoElement.playbackRate);
+      tracker.flush({ final: false, keepalive: false });
+    };
+    const handleEnded = () => {
+      tracker.stopAt(videoElement.currentTime, videoElement.playbackRate);
+      tracker.flush({ final: true, keepalive: false });
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        tracker.stopAt(videoElement.currentTime, videoElement.playbackRate);
+        tracker.flush({ final: false, keepalive: true });
+      } else {
+        tracker.endSeeking(videoElement.currentTime, isActivelyPlaying());
+      }
+    };
+    const handlePageHide = () => {
+      tracker.stopAt(videoElement.currentTime, videoElement.playbackRate);
+      tracker.flush({ final: true, keepalive: true });
     };
 
-    if (videoElement) {
-      videoElement.addEventListener('play', startHeartbeat);
-      videoElement.addEventListener('pause', stopHeartbeat);
-      videoElement.addEventListener('ended', stopHeartbeat);
-      if (!videoElement.paused) startHeartbeat();
+    const interval = setInterval(() => {
+      if (isActivelyPlaying()) {
+        sampleProgress();
+        tracker.flush({ final: false, keepalive: false });
+      }
+    }, 5000);
+
+    videoElement.addEventListener('playing', handlePlaying);
+    videoElement.addEventListener('timeupdate', sampleProgress);
+    videoElement.addEventListener('seeking', handleSeeking);
+    videoElement.addEventListener('seeked', handleSeeked);
+    videoElement.addEventListener('waiting', handleBuffering);
+    videoElement.addEventListener('stalled', handleBuffering);
+    videoElement.addEventListener('pause', handlePause);
+    videoElement.addEventListener('ended', handleEnded);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('pagehide', handlePageHide);
+
+    if (isActivelyPlaying()) {
+      tracker.endSeeking(videoElement.currentTime, true);
     }
 
     return () => {
-      stopHeartbeat();
-      if (videoElement) {
-        videoElement.removeEventListener('play', startHeartbeat);
-        videoElement.removeEventListener('pause', stopHeartbeat);
-        videoElement.removeEventListener('ended', stopHeartbeat);
-      }
+      clearInterval(interval);
+      videoElement.removeEventListener('playing', handlePlaying);
+      videoElement.removeEventListener('timeupdate', sampleProgress);
+      videoElement.removeEventListener('seeking', handleSeeking);
+      videoElement.removeEventListener('seeked', handleSeeked);
+      videoElement.removeEventListener('waiting', handleBuffering);
+      videoElement.removeEventListener('stalled', handleBuffering);
+      videoElement.removeEventListener('pause', handlePause);
+      videoElement.removeEventListener('ended', handleEnded);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('pagehide', handlePageHide);
+      tracker.stopAt(videoElement.currentTime, videoElement.playbackRate);
+      tracker.flush({ final: true, keepalive: true });
     };
-  }, [id, currentUrl]);
+  }, [id, loading, error, video?.id]);
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -387,7 +496,7 @@ export default function VideoDetailPage() {
         <div className="flex-1 min-w-0 w-full">
           
           {/* 1. PEMUTAR VIDEO DENGAN AMBIENT LIGHTING GLOW */}
-          <div className="relative group/player w-full aspect-video rounded-2xl overflow-hidden bg-black shadow-2xl border border-white/5">
+          <div className={`relative group/player w-full rounded-2xl overflow-hidden bg-black shadow-2xl border border-white/5 transition-all duration-300 flex items-center justify-center ${isVertical ? 'h-[60vh] sm:h-[75vh] max-h-[760px]' : 'aspect-video'}`}>
             {/* Ambient Lighting Mode (Glow Sinematik YouTube) */}
             {(video.thumbnail_url || video.thumbnail) && (
               <div className="absolute -inset-8 z-0 opacity-25 blur-[90px] scale-110 pointer-events-none overflow-hidden transition-opacity duration-700">

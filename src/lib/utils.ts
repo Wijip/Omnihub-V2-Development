@@ -6,12 +6,15 @@ export function cn(...inputs: ClassValue[]) {
 }
 
 export function formatWatchTime(seconds: number) {
-  if (!seconds) return '0s';
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = Math.floor(seconds % 60);
-  if (h > 0) return `${h}h ${m}m`;
-  if (m > 0) return `${m}m ${s}s`;
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  if (total <= 0) return '0s';
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) {
+    return [`${h}h`, ...(m > 0 ? [`${m}m`] : []), ...(s > 0 ? [`${s}s`] : [])].join(' ');
+  }
+  if (m > 0) return s > 0 ? `${m}m ${s}s` : `${m}m`;
   return `${s}s`;
 }
 

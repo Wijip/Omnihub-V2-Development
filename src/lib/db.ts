@@ -81,7 +81,8 @@ export const initDB = async () => {
         "ADD COLUMN url VARCHAR(255)",
         "ADD COLUMN thumbnail VARCHAR(255)",
         "ADD COLUMN views INT DEFAULT 0",
-        "ADD COLUMN watch_time INT DEFAULT 0"
+        "ADD COLUMN watch_time INT DEFAULT 0",
+        "ADD COLUMN teacher_note TEXT NULL"
       ];
       for (const col of columnsToAdd) {
         try {

@@ -69,7 +69,7 @@ const LiveStudio: React.FC = () => {
   // Engine HLS.js Decoder untuk Browser Desktop
   useEffect(() => {
     if (liveData.isLive && videoRef.current) {
-      const hlsUrl = `http://${window.location.hostname}:8005/live/${liveData.streamKey}/index.m3u8`;
+      const hlsUrl = (liveData as any).hlsUrl || `http://${window.location.hostname}:8005/live/${liveData.streamKey}/index.m3u8`;
       
       if (videoRef.current.canPlayType('application/vnd.apple.mpegurl')) {
         videoRef.current.src = hlsUrl;

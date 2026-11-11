@@ -6,128 +6,130 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { exec, spawn } from 'node:child_process';
 
-export const screen = blessed.screen({ smartCSR: true, title: 'OmniHub Server Control Center' });
-const grid = new contrib.grid({ rows: 12, cols: 12, screen: screen });
+const isDashboardEnabled = process.env.ENABLE_DASHBOARD === '1' && process.env.RAW_LOGS !== '1';
 
-// 1. KOTAK LOG (Di tengah bawah)
-export const logBox = grid.set(4, 0, 8, 12, contrib.log, {
-  fg: "green",
-  selectedFg: "green",
-  label: ' Server & FFmpeg Logs ',
-  border: { type: 'line', fg: 'cyan' }
-});
+export let screen: any = null;
+export let logBox: any = null;
+let cpuLine: any = null;
+let gpuBox: any = null;
 
-// --- BOTTOM ACTION BAR PANEL (RESPONSIVE ANCHORED) ---
-const actionBox = blessed.box({
-  parent: screen,
-  bottom: 0,
-  left: 0,
-  width: '100%',
-  height: 3,
-  shrink: false,
-  border: { type: 'line' },
-  style: {
-    border: { fg: 'cyan' },
-    bg: 'blue',
-    fg: 'white'
-  },
-  content: ' [1] Maintenance Mode  [2] Bersihkan Temp  [3] Shutdown Aman  [4] Restart Server'
-});
+if (isDashboardEnabled) {
+  screen = blessed.screen({ smartCSR: true, title: 'OmniHub Server Control Center' });
+  const grid = new contrib.grid({ rows: 12, cols: 12, screen: screen });
 
-// Pastikan Log Box dikunci bagian bawahnya di atas actionBox (bottom: 3)
-if (typeof logBox !== 'undefined' && logBox) {
-  logBox.position.bottom = 3;
-}
+  // 1. KOTAK LOG (Di tengah bawah)
+  logBox = grid.set(4, 0, 8, 12, contrib.log, {
+    fg: "green",
+    selectedFg: "green",
+    label: ' Server & FFmpeg Logs ',
+    border: { type: 'line', fg: 'cyan' }
+  });
 
-// Keypress Event Handlers
-screen.key(['1'], () => {
-  (global as any).isMaintenance = !(global as any).isMaintenance;
-  const status = (global as any).isMaintenance ? 'AKTIF' : 'NON-AKTIF';
-  logBox.log(`[SYSTEM] Status Maintenance Mode: ${status}`);
-  screen.render();
-});
+  // --- BOTTOM ACTION BAR PANEL (RESPONSIVE ANCHORED) ---
+  const actionBox = blessed.box({
+    parent: screen,
+    bottom: 0,
+    left: 0,
+    width: '100%',
+    height: 3,
+    shrink: false,
+    border: { type: 'line' },
+    style: {
+      border: { fg: 'cyan' },
+      bg: 'blue',
+      fg: 'white'
+    },
+    content: ' [1] Maintenance Mode  [2] Bersihkan Temp  [3] Shutdown Aman  [4] Restart Server'
+  });
 
-screen.key(['2'], () => {
-  logBox.log('[SYSTEM] Memulai pembersihan berkas temporary...');
-  // Pembersihan cache/temp
-  logBox.log('[SYSTEM] Pembersihan berkas temporary selesai.');
-  screen.render();
-});
-
-screen.key(['3'], () => {
-  logBox.log('[SYSTEM] Memulai proses Shutdown Aman...');
-  screen.render();
-  if (typeof (global as any).gracefulShutdown === 'function') {
-    (global as any).gracefulShutdown();
-  } else {
-    process.exit(0);
+  // Pastikan Log Box dikunci bagian bawahnya di atas actionBox (bottom: 3)
+  if (typeof logBox !== 'undefined' && logBox) {
+    logBox.position.bottom = 3;
   }
-});
 
-// --- TOMBOL [4] RESTART SERVER (STAGE 1.10 CLEAN REBOOT) ---
-screen.key(['4'], () => {
-  logBox.log('{cyan-fg}[SYSTEM] 🔄 Memulai Ulang (Restart) Server OmniHub...{/cyan-fg}');
-  screen.render();
-  
-  setTimeout(() => {
-    try {
-      // Lepaskan layar terminal blessed agar tidak mengunci stdout/stdin
-      screen.destroy();
-    } catch (e) {
-      /* ignore */
-    }
+  // Keypress Event Handlers
+  screen.key(['1'], () => {
+    (global as any).isMaintenance = !(global as any).isMaintenance;
+    const status = (global as any).isMaintenance ? 'AKTIF' : 'NON-AKTIF';
+    logBox.log(`[SYSTEM] Status Maintenance Mode: ${status}`);
+    screen.render();
+  });
 
-    const isWindows = process.platform === 'win32';
+  screen.key(['2'], () => {
+    logBox.log('[SYSTEM] Memulai pembersihan berkas temporary...');
+    logBox.log('[SYSTEM] Pembersihan berkas temporary selesai.');
+    screen.render();
+  });
 
-    // 1. Jika dijalankan melalui run_dev.bat (ada environment OMNIHUB_MANAGED_RESTART)
-    if (process.env.OMNIHUB_MANAGED_RESTART === '1') {
-      console.log('\n[SYSTEM] Sinyal reboot dikirim (Exit Code 42). Memulai ulang proses...');
-      process.exit(42);
-      return;
-    }
-
-    // 2. Fallback jika server dijalankan mandiri di luar run_dev.bat:
-    const batPath = path.resolve(process.cwd(), 'run_dev.bat');
-    if (isWindows && fs.existsSync(batPath)) {
-      console.log('\n[SYSTEM] Menjalankan kembali via run_dev.bat...');
-      const child = spawn('cmd.exe', ['/c', 'start', '""', 'run_dev.bat'], {
-        cwd: process.cwd(),
-        detached: true,
-        stdio: 'ignore'
-      });
-      child.unref();
-      process.exit(0);
+  screen.key(['3'], () => {
+    logBox.log('[SYSTEM] Memulai proses Shutdown Aman...');
+    screen.render();
+    if (typeof (global as any).gracefulShutdown === 'function') {
+      (global as any).gracefulShutdown();
     } else {
-      console.log('\n[SYSTEM] Menjalankan kembali via npm run dev...');
-      const npmCmd = isWindows ? 'npm.cmd' : 'npm';
-      const child = spawn(npmCmd, ['run', 'dev'], {
-        cwd: process.cwd(),
-        detached: true,
-        stdio: 'inherit',
-        shell: isWindows
-      });
-      child.unref();
       process.exit(0);
     }
-  }, 500);
-});
+  });
 
-// 2. GRAFIK CPU & RAM (Kiri Atas)
-const cpuLine = grid.set(0, 0, 4, 6, contrib.line, {
-  style: { line: "yellow", text: "green", baseline: "black" },
-  xLabelPadding: 0,
-  xPadding: 0,
-  showLegend: false, // Dihilangkan agar grafik lebih lebar dan bersih ala btop
-  wholeNumbersOnly: false,
-  label: ' Menghitung Telemetri... '
-});
+  // --- TOMBOL [4] RESTART SERVER (STAGE 1.10 CLEAN REBOOT) ---
+  screen.key(['4'], () => {
+    logBox.log('{cyan-fg}[SYSTEM] 🔄 Memulai Ulang (Restart) Server OmniHub...{/cyan-fg}');
+    screen.render();
+    
+    setTimeout(() => {
+      try {
+        screen.destroy();
+      } catch (e) {}
 
-// 3. TELEMETRI GPU NVENC (Kanan Atas)
-const gpuBox = grid.set(0, 6, 4, 6, blessed.box, {
-  label: ' NVIDIA NVENC Monitor ',
-  content: '\n  Menunggu pembacaan sensor...',
-  style: { fg: 'white', border: { fg: 'cyan' } }
-});
+      const isWindows = process.platform === 'win32';
+      if (process.env.OMNIHUB_MANAGED_RESTART === '1') {
+        console.log('\n[SYSTEM] Sinyal reboot dikirim (Exit Code 42). Memulai ulang proses...');
+        process.exit(42);
+        return;
+      }
+
+      const batPath = path.resolve(process.cwd(), 'run_dev.bat');
+      if (isWindows && fs.existsSync(batPath)) {
+        console.log('\n[SYSTEM] Menjalankan kembali via run_dev.bat...');
+        const child = spawn('cmd.exe', ['/c', 'start', '""', 'run_dev.bat'], {
+          cwd: process.cwd(),
+          detached: true,
+          stdio: 'ignore'
+        });
+        child.unref();
+        process.exit(0);
+      } else {
+        console.log('\n[SYSTEM] Menjalankan kembali via npm run dev...');
+        const npmCmd = isWindows ? 'npm.cmd' : 'npm';
+        const child = spawn(npmCmd, ['run', 'dev'], {
+          cwd: process.cwd(),
+          detached: true,
+          stdio: 'inherit',
+          shell: isWindows
+        });
+        child.unref();
+        process.exit(0);
+      }
+    }, 500);
+  });
+
+  // 2. GRAFIK CPU & RAM (Kiri Atas)
+  cpuLine = grid.set(0, 0, 4, 6, contrib.line, {
+    style: { line: "yellow", text: "green", baseline: "black" },
+    xLabelPadding: 0,
+    xPadding: 0,
+    showLegend: false,
+    wholeNumbersOnly: false,
+    label: ' Menghitung Telemetri... '
+  });
+
+  // 3. TELEMETRI GPU NVENC (Kanan Atas)
+  gpuBox = grid.set(0, 6, 4, 6, blessed.box, {
+    label: ' NVIDIA NVENC Monitor ',
+    content: '\n  Menunggu pembacaan sensor...',
+    style: { fg: 'white', border: { fg: 'cyan' } }
+  });
+}
 
 // Variabel Penampung Data Grafik
 const cpuData = { title: 'CPU', x: [] as string[], y: [] as number[], style: { line: 'red' } };
@@ -166,6 +168,11 @@ let screenInitialized = false;
 export function initDashboard() {
   if (screenInitialized) return;
   screenInitialized = true;
+
+  if (!isDashboardEnabled) {
+    console.log('[SYSTEM] 📋 Terminal Streaming Log Mode Aktif: Seluruh output & FFmpeg log ditampilkan di terminal.');
+    return;
+  }
 
   // --- STAGE 1.11: COMPLETE CONSOLE & STDOUT INTERCEPTOR ---
   const originalLog = console.log;
