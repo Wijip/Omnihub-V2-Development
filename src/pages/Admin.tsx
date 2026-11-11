@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Link } from 'react-router-dom';
 import useSWR from 'swr';
 import api from '../lib/api';
@@ -6,7 +6,7 @@ import {
   BarChart2, Users, Play, Eye, TrendingUp, TrendingDown, 
   Loader2, ChevronRight, Settings, Save, PieChart, 
   Cpu, HardDrive, Activity, Clock, AlertCircle, CheckCircle2,
-  MessageSquare, EyeOff, Trash2, X, Lock, Database, Calendar
+  MessageSquare, EyeOff, Trash2, X, Lock, Database, Calendar, RotateCcw
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { TableRowSkeleton } from '../components/Skeleton';
@@ -36,6 +36,70 @@ export default function AdminPage() {
   const [settings, setSettings] = useState<any[]>([]);
   const [activeTab, setActiveTab] = useState<'stats' | 'settings' | 'users' | 'reports' | 'comments' | 'programs'>('stats');
   const [saveStatus, setSaveStatus] = useState<string | null>(null);
+  const [restartState, setRestartState] = useState<'idle' | 'confirm' | 'restarting' | 'done' | 'error'>('idle');
+  const [restartMessage, setRestartMessage] = useState<string | null>(null);
+  const restartTimerRef = useRef<number | null>(null);
+  const isMountedRef = useRef(true);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      if (restartTimerRef.current !== null) {
+        window.clearTimeout(restartTimerRef.current);
+      }
+    };
+  }, []);
+
+  const handleConfirmRestart = async () => {
+    const previousStartedAt = stats?.serverStartedAt || null;
+    if (restartTimerRef.current !== null) {
+      window.clearTimeout(restartTimerRef.current);
+    }
+    setRestartState('restarting');
+    setRestartMessage('Mengirim sinyal restart ke server...');
+
+    try {
+      await api.post('/admin/restart');
+      if (!isMountedRef.current) return;
+      setRestartMessage('Menunggu proses server aktif kembali...');
+
+      const pollServerBackOnline = async (attempt: number) => {
+        if (!isMountedRef.current) return;
+        if (attempt > 25) {
+          setRestartState('error');
+          setRestartMessage('Server belum merespons ulang. Jika tidak berjalan via run_dev.bat, jalankan ulang npm run dev secara manual.');
+          return;
+        }
+        try {
+          const res = await api.get('/admin/stats');
+          if (!isMountedRef.current) return;
+          const nextStartedAt = res.data?.serverStartedAt || null;
+          if (!previousStartedAt || nextStartedAt !== previousStartedAt) {
+            await mutateStats(res.data, false);
+            setRestartState('done');
+            setRestartMessage('Server berhasil restart dan sudah aktif kembali.');
+            restartTimerRef.current = window.setTimeout(() => {
+              if (isMountedRef.current) {
+                setRestartState('idle');
+                setRestartMessage(null);
+              }
+            }, 5000);
+            return;
+          }
+        } catch {
+          // Server masih proses mematikan & menyalakan ulang
+        }
+        restartTimerRef.current = window.setTimeout(() => pollServerBackOnline(attempt + 1), 1500);
+      };
+
+      restartTimerRef.current = window.setTimeout(() => pollServerBackOnline(1), 1200);
+    } catch (err: any) {
+      if (!isMountedRef.current) return;
+      setRestartState('error');
+      setRestartMessage(err?.response?.data?.error || 'Gagal mengirim perintah restart server.');
+    }
+  };
   
   const [programsList, setProgramsList] = useState<any[]>([]);
   const [studentProgressList, setStudentProgressList] = useState<any[]>([]);
@@ -179,8 +243,28 @@ export default function AdminPage() {
       {/* Header Section */}
       <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-8">
         <div className="space-y-2">
-          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-brand-50 dark:bg-brand-500/10 text-brand-600 dark:text-brand-400 text-[10px] font-black uppercase tracking-widest">
-            <Activity size={12} /> System Overview
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-brand-50 dark:bg-brand-500/10 text-brand-600 dark:text-brand-400 text-[10px] font-black uppercase tracking-widest">
+              <Activity size={12} /> System Overview
+            </div>
+            {stats?.serverStartedAt && (
+              <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-neutral-100 dark:bg-neutral-800/80 text-neutral-600 dark:text-neutral-300 text-[10px] font-bold border border-neutral-200 dark:border-neutral-700/80">
+                <Clock size={11} />
+                <span>
+                  Server aktif sejak{' '}
+                  {new Date(stats.serverStartedAt).toLocaleTimeString('id-ID', {
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    second: '2-digit',
+                  })}
+                </span>
+                {stats?.watchTimeEngine && (
+                  <span className="text-brand-600 dark:text-brand-400 font-black">
+                    • {stats.watchTimeEngine}
+                  </span>
+                )}
+              </div>
+            )}
           </div>
           <h1 className="text-3xl md:text-5xl font-black font-display tracking-tight text-neutral-900 dark:text-white">
             Admin Dashboard
@@ -190,7 +274,71 @@ export default function AdminPage() {
           </p>
         </div>
 
-        <div className="flex bg-neutral-100 dark:bg-neutral-900 p-1.5 rounded-2xl overflow-x-auto no-scrollbar glass shadow-inner border border-neutral-200 dark:border-neutral-800">
+        <div className="flex flex-col items-stretch lg:items-end gap-3">
+          <div className="flex flex-wrap items-center lg:justify-end gap-2">
+            {restartState === 'confirm' ? (
+              <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl bg-rose-50 dark:bg-rose-500/10 border border-rose-200 dark:border-rose-500/30 text-xs">
+                <span className="font-bold text-rose-700 dark:text-rose-300">
+                  Restart server backend sekarang?
+                </span>
+                <button
+                  type="button"
+                  onClick={handleConfirmRestart}
+                  className="px-3 py-1 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-bold transition-colors"
+                >
+                  Konfirmasi
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setRestartState('idle')}
+                  className="px-2.5 py-1 rounded-lg bg-neutral-200 dark:bg-neutral-800 text-neutral-700 dark:text-neutral-300 font-semibold hover:bg-neutral-300 dark:hover:bg-neutral-700 transition-colors"
+                >
+                  Batal
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                disabled={restartState === 'restarting'}
+                onClick={() => {
+                  setRestartState('confirm');
+                  setRestartMessage(null);
+                }}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-neutral-100 dark:bg-neutral-900 hover:bg-neutral-200 dark:hover:bg-neutral-800 border border-neutral-200 dark:border-neutral-800 text-xs font-bold text-neutral-700 dark:text-neutral-200 transition-all disabled:opacity-60"
+              >
+                {restartState === 'restarting' ? (
+                  <Loader2 size={14} className="animate-spin text-brand-500" />
+                ) : (
+                  <RotateCcw size={14} />
+                )}
+                <span>{restartState === 'restarting' ? 'Merestart Server...' : 'Restart Server'}</span>
+              </button>
+            )}
+          </div>
+
+          {restartMessage && (
+            <div
+              className={cn(
+                'inline-flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-semibold border',
+                restartState === 'done'
+                  ? 'bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-500/30'
+                  : restartState === 'error'
+                  ? 'bg-rose-50 dark:bg-rose-500/10 text-rose-700 dark:text-rose-300 border-rose-200 dark:border-rose-500/30'
+                  : 'bg-brand-50 dark:bg-brand-500/10 text-brand-700 dark:text-brand-300 border-brand-200 dark:border-brand-500/30'
+              )}
+            >
+              {restartState === 'done' ? (
+                <CheckCircle2 size={13} />
+              ) : restartState === 'error' ? (
+                <AlertCircle size={13} />
+              ) : (
+                <Loader2 size={13} className="animate-spin" />
+              )}
+              <span>{restartMessage}</span>
+            </div>
+          )}
+
+          <div className="flex bg-neutral-100 dark:bg-neutral-900 p-1.5 rounded-2xl overflow-x-auto no-scrollbar glass shadow-inner border border-neutral-200 dark:border-neutral-800">
           {(['stats', 'settings', 'users', 'comments', 'reports', 'programs'] as const).map((tab) => (
             <button
               key={tab}
@@ -211,6 +359,7 @@ export default function AdminPage() {
               )}
             </button>
           ))}
+          </div>
         </div>
       </div>
 

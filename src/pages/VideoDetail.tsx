@@ -222,6 +222,7 @@ export default function VideoDetailPage() {
     videoElement.addEventListener('timeupdate', sampleProgress);
     videoElement.addEventListener('seeking', handleSeeking);
     videoElement.addEventListener('seeked', handleSeeked);
+    videoElement.addEventListener('ratechange', handleSeeked);
     videoElement.addEventListener('waiting', handleBuffering);
     videoElement.addEventListener('stalled', handleBuffering);
     videoElement.addEventListener('pause', handlePause);
@@ -239,6 +240,7 @@ export default function VideoDetailPage() {
       videoElement.removeEventListener('timeupdate', sampleProgress);
       videoElement.removeEventListener('seeking', handleSeeking);
       videoElement.removeEventListener('seeked', handleSeeked);
+      videoElement.removeEventListener('ratechange', handleSeeked);
       videoElement.removeEventListener('waiting', handleBuffering);
       videoElement.removeEventListener('stalled', handleBuffering);
       videoElement.removeEventListener('pause', handlePause);

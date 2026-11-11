@@ -71,6 +71,9 @@ const __dirname = path.dirname(__filename);
 // @ts-ignore
 import NodeMediaServer from 'node-media-server';
 import { initDashboard, logBox } from './lib/dashboard';
+import { WATCH_TIME_ENGINE, validateHeartbeatPayload, claimWatchSessionIncrement } from './lib/watchTimeGuard';
+
+const SERVER_STARTED_AT = new Date().toISOString();
 
 // --- DYNAMIC PORT TRACKERS (HTTP, SOCKET.IO & RTMP) ---
 let currentAppPort = 3000;
@@ -141,15 +144,15 @@ export function obfuscateFileInPlace(filePath: string) {
   if (!fs.existsSync(filePath)) return;
   const fd = fs.openSync(filePath, 'r+');
   const buffer = Buffer.alloc(OBFUSCATE_SIZE);
-  
+
   // Baca hanya byte pertama
   const bytesRead = fs.readSync(fd, buffer, 0, OBFUSCATE_SIZE, 0);
-  
+
   // Lakukan XOR hanya pada byte yang berhasil dibaca
   for (let i = 0; i < bytesRead; i++) {
     buffer[i] = buffer[i] ^ XOR_KEY;
   }
-  
+
   // Tulis kembali byte yang sudah diubah ke posisi paling awal (offset 0)
   fs.writeSync(fd, buffer, 0, bytesRead, 0);
   fs.closeSync(fd);
@@ -321,37 +324,37 @@ const CONFIG_PATH = path.join(process.cwd(), 'omnihub.config.json');
 
 // Auto-generate file jika belum ada
 if (!fs.existsSync(CONFIG_PATH)) {
-    const defaultConfig = {
-        resolutions: { "144p": false, "240p": false, "360p": true, "480p": true, "720p": true, "1080p": true }
-    };
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(defaultConfig, null, 2));
+  const defaultConfig = {
+    resolutions: { "144p": false, "240p": false, "360p": true, "480p": true, "720p": true, "1080p": true }
+  };
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(defaultConfig, null, 2));
 }
 
 // Endpoint GET konfigurasi
 app.get('/api/admin/config', (req, res) => {
-    try {
-        const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
-        res.json(config);
-    } catch (error) {
-        res.status(500).json({ error: true, message: 'Gagal membaca konfigurasi' });
-    }
+  try {
+    const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
+    res.json(config);
+  } catch (error) {
+    res.status(500).json({ error: true, message: 'Gagal membaca konfigurasi' });
+  }
 });
 
 // Endpoint POST konfigurasi
 app.post('/api/admin/config', (req, res) => {
-    try {
-        const { resolutions } = req.body;
-        const config = { resolutions };
-        fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
-        res.json({ success: true, message: 'Konfigurasi resolusi diperbarui' });
-    } catch (error) {
-        res.status(500).json({ error: true, message: 'Gagal menyimpan konfigurasi' });
-    }
+  try {
+    const { resolutions } = req.body;
+    const config = { resolutions };
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+    res.json({ success: true, message: 'Konfigurasi resolusi diperbarui' });
+  } catch (error) {
+    res.status(500).json({ error: true, message: 'Gagal menyimpan konfigurasi' });
+  }
 });
 
 // Endpoint GET profil arsitektur & kapabilitas GPU (Ampere vs Maxwell / GTX 900 series)
 app.get('/api/admin/gpu-profile', (req, res) => {
-    res.json(gpuProfile);
+  res.json(gpuProfile);
 });
 
 // ============================================================================
@@ -547,10 +550,10 @@ app.use((req, res, next) => {
 
 const gracefulShutdown = () => {
   console.log('[SHUTDOWN] Memeriksa aktivitas background pipeline...');
-  
+
   // Membaca counter antrean aktif dari sistem (jika ada variabel global tracking antreanmu, sesuaikan di sini)
   const activeTasks = (global as any).activeTasksCount || 0;
-  
+
   if (activeTasks > 0) {
     console.log(`[SHUTDOWN] Penundaan terdeteksi: ${activeTasks} video masih dalam antrean encoding. Menunggu selesai...`);
     (global as any).isShuttingDown = true;
@@ -570,9 +573,9 @@ async function initializeDatabase(retryCount = 0) {
   try {
     // Pemanasan: Coba lakukan query ringan untuk memastikan Pool benar-benar siap
     await db.query('SELECT 1');
-    
+
     if (retryCount === 0) console.log('[DB INIT] Memulai pengecekan struktur tabel otomatis...');
-    
+
     // 1. Pembuatan Tabel Channels
     await db.query(`
       CREATE TABLE IF NOT EXISTS Channels (
@@ -587,7 +590,7 @@ async function initializeDatabase(retryCount = 0) {
         CONSTRAINT fk_channels_user_id FOREIGN KEY (user_id) REFERENCES Users(id) ON DELETE CASCADE
       )
     `);
-    
+
     // 1.5 Pembuatan Tabel Arsip (videos_deleted)
     await db.query(`
       CREATE TABLE IF NOT EXISTS videos_deleted (
@@ -634,11 +637,11 @@ async function initializeDatabase(retryCount = 0) {
       FROM Users 
       WHERE NOT EXISTS (SELECT 1 FROM Channels WHERE user_id = Users.id)
     `);
-    
+
     if (syncResult && syncResult.affectedRows > 0) {
       console.log(`[DB INIT] Berhasil menyinkronkan ${syncResult.affectedRows} akun baru ke tabel Channels.`);
     }
-    
+
     if (retryCount > 0) {
       console.log('[DB INIT] Pengecekan tertunda berhasil dieksekusi setelah database siap.');
     } else {
@@ -672,13 +675,13 @@ function streamFileToResponse(req: any, res: any, filePath: string, fileName: st
     const start = parseInt(parts[0], 10);
     const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
     const chunksize = (end - start) + 1;
-    
+
     res.writeHead(206, {
       'Content-Range': `bytes ${start}-${end}/${fileSize}`,
       'Accept-Ranges': 'bytes',
       'Content-Length': chunksize,
     });
-    
+
     if (isOmni) {
       const stream = createRestoredStream(filePath, start, end);
       stream.pipe(res);
@@ -717,22 +720,22 @@ app.get('/processed/:id/:filename', (req: any, res: any) => {
   // If it's a legacy actual .mp4/.jpg, serve it normally
   const normalPath = path.join(PROCESSED_DIR, fileId, fileName);
   const omniPath = path.join(PROCESSED_DIR, fileId, fileName + '.omni');
-  
+
   if (fs.existsSync(omniPath)) {
-     streamFileToResponse(req, res, omniPath, fileName, true);
+    streamFileToResponse(req, res, omniPath, fileName, true);
   } else if (fs.existsSync(normalPath)) {
-     streamFileToResponse(req, res, normalPath, fileName, false);
+    streamFileToResponse(req, res, normalPath, fileName, false);
   } else {
-     // Check if it's right in the processed directory itself (e.g. legacy)
-     const directNormal = path.join(PROCESSED_DIR, fileId);
-     const directOmni = path.join(PROCESSED_DIR, fileId + '.omni');
-     if (fs.existsSync(directOmni)) {
-         streamFileToResponse(req, res, directOmni, fileName, true);
-     } else if (fs.existsSync(directNormal)) {
-         streamFileToResponse(req, res, directNormal, fileName, false);
-     } else {
-         res.status(404).send('Not Found');
-     }
+    // Check if it's right in the processed directory itself (e.g. legacy)
+    const directNormal = path.join(PROCESSED_DIR, fileId);
+    const directOmni = path.join(PROCESSED_DIR, fileId + '.omni');
+    if (fs.existsSync(directOmni)) {
+      streamFileToResponse(req, res, directOmni, fileName, true);
+    } else if (fs.existsSync(directNormal)) {
+      streamFileToResponse(req, res, directNormal, fileName, false);
+    } else {
+      res.status(404).send('Not Found');
+    }
   }
 });
 
@@ -740,13 +743,13 @@ app.get('/thumbnails/:filename', (req: any, res: any) => {
   const fileName = req.params.filename;
   const normalPath = path.join(THUMBNAIL_DIR, fileName);
   const omniPath = path.join(THUMBNAIL_DIR, fileName + '.omni');
-  
+
   if (fs.existsSync(omniPath)) {
-     streamFileToResponse(req, res, omniPath, fileName, true);
+    streamFileToResponse(req, res, omniPath, fileName, true);
   } else if (fs.existsSync(normalPath)) {
-     streamFileToResponse(req, res, normalPath, fileName, false);
+    streamFileToResponse(req, res, normalPath, fileName, false);
   } else {
-     res.status(404).send('Not Found');
+    res.status(404).send('Not Found');
   }
 });
 
@@ -754,13 +757,13 @@ app.get('/uploads/:filename', (req: any, res: any) => {
   const fileName = req.params.filename;
   const normalPath = path.join(UPLOAD_DIR, fileName);
   const omniPath = path.join(UPLOAD_DIR, fileName + '.omni');
-  
+
   if (fs.existsSync(omniPath)) {
-     streamFileToResponse(req, res, omniPath, fileName, true);
+    streamFileToResponse(req, res, omniPath, fileName, true);
   } else if (fs.existsSync(normalPath)) {
-     streamFileToResponse(req, res, normalPath, fileName, false);
+    streamFileToResponse(req, res, normalPath, fileName, false);
   } else {
-     res.status(404).send('Not Found');
+    res.status(404).send('Not Found');
   }
 });
 // -----------------------------------
@@ -1302,7 +1305,7 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
       const relativeThumbPath = `processed/${videoId}/thumbnail.jpg`;
       const absoluteThumbDir = path.join(PROCESSED_DIR, String(videoId));
       const absoluteThumbPath = path.join(absoluteThumbDir, 'thumbnail.jpg');
-      
+
       if (!fs.existsSync(absoluteThumbDir)) {
         fs.mkdirSync(absoluteThumbDir, { recursive: true });
       }
@@ -1310,8 +1313,8 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
       await new Promise<void>((resolveThumb) => {
         const stat = fs.statSync(activeInputPath);
         if (!stat.isFile()) {
-            resolveThumb();
-            return;
+          resolveThumb();
+          return;
         }
         ffmpeg(activeInputPath)
           .on('end', () => {
@@ -1345,25 +1348,25 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
 
       // Phase 1 (Efficiency Pass) & Phase 2 (Quality Pass) Hybrid Transcoding
       let activeResolutions = Object.entries(encodingSettings).filter(([_, config]: any) => config.active);
-      
+
       // --- INJEKSI FILTER RESOLUSI DINAMIS ---
       try {
         const currentConfig = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8')).resolutions;
         activeResolutions = activeResolutions.filter(([resName, _]: any) => {
-            return currentConfig[resName] === true;
+          return currentConfig[resName] === true;
         });
       } catch (err) {
         console.error('[SYSTEM] Gagal membaca konfigurasi resolusi dinamis', err);
       }
       // ---------------------------------------
-      
+
       // Adaptive input mechanism: skip generating output resolutions higher than source short dimension
       const sourceMinDim = Math.min(effectiveWidth, effectiveHeight);
       if (sourceMinDim > 0) {
         activeResolutions = activeResolutions.filter(([_, config]: any) => config.height <= sourceMinDim + 16);
         if (activeResolutions.length === 0) {
-           const smallest = Object.entries(encodingSettings).filter(([_, config]: any) => config.active).sort((a: any, b: any) => a[1].height - b[1].height)[0];
-           if (smallest) activeResolutions.push(smallest);
+          const smallest = Object.entries(encodingSettings).filter(([_, config]: any) => config.active).sort((a: any, b: any) => a[1].height - b[1].height)[0];
+          if (smallest) activeResolutions.push(smallest);
         }
       }
 
@@ -1377,10 +1380,10 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
       const totalWeight = (phase1Resolutions.length > 0 ? 40 : 0) + (phase2Resolutions.length > 0 ? 60 : 0);
       let currentProgressBase = 0;
 
-      const runPhase = async (resolutions: any[], passName: string, preset: string, weightInfo: {base: number, weight: number}) => {
+      const runPhase = async (resolutions: any[], passName: string, preset: string, weightInfo: { base: number, weight: number }) => {
         if (resolutions.length === 0) return;
         console.log(`[SYSTEM] Starting ${passName} for VideoID: ${videoId} with resolutions:`, resolutions.map(r => r[0]).join(', '));
-        
+
         // --- ADAPTIVE RESOLUTION COMPRESSION MATRIX (TAHAP 55.4) ---
         interface ResolutionProfile {
           name: string;
@@ -1394,9 +1397,9 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
 
         const RESOLUTION_PROFILES: Record<string, ResolutionProfile> = {
           '1080p': { name: '1080p', width: 1920, height: 1080, bitrate: '2500k', maxrate: '3500k', bufsize: '5000k', cq: 26 },
-          '720p':  { name: '720p',  width: 1280, height: 720,  bitrate: '1200k', maxrate: '1800k', bufsize: '2500k', cq: 28 },
-          '480p':  { name: '480p',  width: 854,  height: 480,  bitrate: '600k',  maxrate: '900k',  bufsize: '1200k', cq: 30 },
-          '360p':  { name: '360p',  width: 640,  height: 360,  bitrate: '350k',  maxrate: '500k',  bufsize: '700k',  cq: 32 }
+          '720p': { name: '720p', width: 1280, height: 720, bitrate: '1200k', maxrate: '1800k', bufsize: '2500k', cq: 28 },
+          '480p': { name: '480p', width: 854, height: 480, bitrate: '600k', maxrate: '900k', bufsize: '1200k', cq: 30 },
+          '360p': { name: '360p', width: 640, height: 360, bitrate: '350k', maxrate: '500k', bufsize: '700k', cq: 32 }
         };
 
         const getTargetBox = (profile: ResolutionProfile) => ({
@@ -1418,7 +1421,7 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
           const args = [
             '-progress', 'pipe:1',
             '-nostats',
-            
+
             // Demuxer Fixes & Timestamp Sync
             '-fflags', '+genpts+discardcorrupt',
             '-avoid_negative_ts', 'make_zero',
@@ -1535,7 +1538,7 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
               remainder += chunk.toString();
               const lines = remainder.split('\n');
               remainder = lines.pop() || '';
-              
+
               for (const line of lines) {
                 const [key, value] = line.trim().split('=');
                 // --- STRICT 99% CAP FFMPEG PARSER + THROTTLED SOCKET EMISSION (STAGE 1.2) ---
@@ -1544,10 +1547,10 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
                   if (!isNaN(microseconds) && fileTotalDuration > 0) {
                     const currentSeconds = microseconds / 1000000;
                     const calculatedPercent = Math.min(99, Math.max(1, Math.floor((currentSeconds / fileTotalDuration) * 100)));
-                    
+
                     const passProgress = (calculatedPercent * weightInfo.weight) / 100;
                     const totalProgress = Math.min(99, Math.floor(weightInfo.base + passProgress));
-                    
+
                     if (uploadIdStr) {
                       encodingProgressMap.set(uploadIdStr, totalProgress);
                     }
@@ -1557,8 +1560,8 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
                     if (totalProgress > lastProgressEmit && (now - lastEmitTimestamp >= 300 || totalProgress === 99)) {
                       lastProgressEmit = totalProgress;
                       lastEmitTimestamp = now;
-                      io.emit('video-progress-' + videoId, { 
-                        status: 'processing', 
+                      io.emit('video-progress-' + videoId, {
+                        status: 'processing',
                         progress: totalProgress,
                         encodingProgress: totalProgress,
                         resolution: `${passName} (${resolutions.map(r => r[0]).join(', ')})`,
@@ -1594,7 +1597,7 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
 
             ffmpegProc.on('close', async (code) => {
               if (uploadIdStr) activeFFmpegProcesses.delete(uploadIdStr);
-              
+
               if (code === 0) {
                 resolve();
               } else {
@@ -1663,7 +1666,7 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
           const [resKey, resConfig] = resolutions[i];
           const outputPath = path.join(PROCESSED_DIR, `processed-${videoId}-${resKey}.mp4`);
           try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch (e) { /* ignore */ }
-          
+
           await executeTranscodingWithFallback(uploadId || '', activeInputPath, outputPath, resKey);
         }
       };
@@ -1685,7 +1688,7 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
           const publicUrl = `/processed/processed-${videoId}-${resKey}.mp4`;
           const actualPath = path.join(PROCESSED_DIR, `processed-${videoId}-${resKey}.mp4`);
           const omniPath = actualPath + '.omni';
-          
+
           if (fs.existsSync(actualPath)) {
             fs.renameSync(actualPath, omniPath);
             obfuscateFileInPlace(omniPath);
@@ -1693,7 +1696,7 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
 
           const resConfigAny = resConfig as any;
           const [existingRes]: any = await db.query('SELECT id FROM VideoResolutions WHERE video_id = ? AND resolution = ?', [videoId, resKey]);
-          
+
           if (existingRes && existingRes.length > 0) {
             await db.execute('UPDATE VideoResolutions SET url = ?, status = ? WHERE id = ?', [publicUrl, 'ready', existingRes[0].id]);
           } else {
@@ -1768,12 +1771,12 @@ function processVideo(videoId: number, inputPath: string, originalFilename: stri
         io.emit('encoding-progress-' + uploadId, { status: 'failed', error: error.message || 'Processing failed' });
       }
       await systemLog('ERROR', 'FFmpeg', `Multi-resolution processing failed for video ${videoId}`, { error: error.message });
-      
+
       // Cleanup source file (Stage 1.6)
       if (fs.existsSync(activeInputPath)) {
         try { fs.unlinkSync(activeInputPath); } catch (e) { /* ignore */ }
       }
-      
+
       currentTranscodingVideoId = null;
       // Important to call resolveQueue even on error to unblock PQueue
       return resolveQueue();
@@ -1824,17 +1827,17 @@ app.post('/api/auth/register', async (req, res) => {
   console.log('[API CALL] ' + req.originalUrl);
   try {
     const { email, password, firstName, lastName } = req.body;
-    
+
     const [existing]: any = await db.execute('SELECT id FROM Users WHERE email = ?', [email]);
     if (existing.length > 0) return res.status(400).json({ error: 'Email already exists' });
 
     const hashedPassword = await bcrypt.hash(password, 10);
-    
+
     const [result]: any = await db.execute(
       'INSERT INTO Users (email, password, firstName, lastName, role) VALUES (?, ?, ?, ?, ?)',
       [email, hashedPassword, firstName, lastName, 'user']
     );
-    
+
     const token = jwt.sign({ id: result.insertId, email, role: 'user' }, JWT_SECRET);
     res.json({ token, user: { id: result.insertId, email, firstName, lastName, role: 'user' } });
   } catch (error) {
@@ -1848,32 +1851,32 @@ app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     const [users]: any = await db.execute('SELECT * FROM Users WHERE email = ?', [email]);
-    
+
     if (users.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
-    
+
     const user = users[0];
     const isPasswordValid = await bcrypt.compare(password, user.password);
-    
+
     if (!isPasswordValid) return res.status(401).json({ error: 'Invalid credentials' });
-    
+
     // PASTIKAN TOKEN DIBUAT DENGAN VARIABEL JWT_SECRET STATIS
     const token = jwt.sign(
-      { id: user.id, email: user.email, role: user.role }, 
-      JWT_SECRET, 
+      { id: user.id, email: user.email, role: user.role },
+      JWT_SECRET,
       { expiresIn: '7d' }
     );
-    
+
     // PASTIKAN TOKEN DIKIRIMKAN SECARA EKSPLISIT DENGAN KEY 'token'
-    res.json({ 
-      message: 'Login successful', 
-      token: token, 
-      user: { 
-        id: user.id, 
-        email: user.email, 
-        firstName: user.firstName, 
-        lastName: user.lastName, 
-        role: user.role 
-      } 
+    res.json({
+      message: 'Login successful',
+      token: token,
+      user: {
+        id: user.id,
+        email: user.email,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        role: user.role
+      }
     });
   } catch (error) {
     console.error('Login error:', error);
@@ -1891,175 +1894,175 @@ app.get('/api/auth/me', authenticate, async (req: any, res) => {
   }
 });
 
-  // ==========================================
-  // --- SISTEM TIKET RESET PASSWORD (SELF-SERVICE) ---
-  // ==========================================
+// ==========================================
+// --- SISTEM TIKET RESET PASSWORD (SELF-SERVICE) ---
+// ==========================================
 
-  // 1. USER: Request Tiket Reset (Berdasarkan username)
-  app.post('/api/auth/forgot-password', async (req, res) => {
-    try {
-      const { email } = req.body;
-      const [users]: any = await db.query('SELECT id FROM Users WHERE email = ?', [email]);
-      if (users.length === 0) return res.status(404).json({ error: 'User tidak ditemukan' });
-      
-      const userId = users[0].id;
-      // Generate Tiket Unik (contoh: RST-A1B2C3D4)
-      const crypto = await import('crypto');
-      const ticketCode = 'RST-' + crypto.randomBytes(4).toString('hex').toUpperCase();
-      
-      // Expired 24 jam dari sekarang
-      const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+// 1. USER: Request Tiket Reset (Berdasarkan username)
+app.post('/api/auth/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+    const [users]: any = await db.query('SELECT id FROM Users WHERE email = ?', [email]);
+    if (users.length === 0) return res.status(404).json({ error: 'User tidak ditemukan' });
 
-      await db.query(
-        'INSERT INTO password_resets (user_id, ticket_code, expires_at) VALUES (?, ?, ?)',
-        [userId, ticketCode, expiresAt]
-      );
+    const userId = users[0].id;
+    // Generate Tiket Unik (contoh: RST-A1B2C3D4)
+    const crypto = await import('crypto');
+    const ticketCode = 'RST-' + crypto.randomBytes(4).toString('hex').toUpperCase();
 
-      res.json({ message: 'Tiket berhasil dibuat', ticket: ticketCode });
-    } catch (error) {
-      console.error('[FORGOT PWD ERROR]', error);
-      res.status(500).json({ error: 'Gagal membuat tiket' });
+    // Expired 24 jam dari sekarang
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+    await db.query(
+      'INSERT INTO password_resets (user_id, ticket_code, expires_at) VALUES (?, ?, ?)',
+      [userId, ticketCode, expiresAt]
+    );
+
+    res.json({ message: 'Tiket berhasil dibuat', ticket: ticketCode });
+  } catch (error) {
+    console.error('[FORGOT PWD ERROR]', error);
+    res.status(500).json({ error: 'Gagal membuat tiket' });
+  }
+});
+
+// 2. USER: Cek Status Tiket
+app.get('/api/auth/reset-ticket/:ticket', async (req, res) => {
+  try {
+    const [tickets]: any = await db.query(
+      'SELECT status, expires_at FROM password_resets WHERE ticket_code = ?',
+      [req.params.ticket]
+    );
+    if (tickets.length === 0) return res.status(404).json({ error: 'Tiket tidak valid' });
+
+    const ticket = tickets[0];
+    if (new Date(ticket.expires_at) < new Date() && ticket.status === 'pending') {
+      await db.query('UPDATE password_resets SET status = "expired" WHERE ticket_code = ?', [req.params.ticket]);
+      return res.json({ status: 'expired' });
     }
-  });
 
-  // 2. USER: Cek Status Tiket
-  app.get('/api/auth/reset-ticket/:ticket', async (req, res) => {
-    try {
-      const [tickets]: any = await db.query(
-        'SELECT status, expires_at FROM password_resets WHERE ticket_code = ?', 
-        [req.params.ticket]
-      );
-      if (tickets.length === 0) return res.status(404).json({ error: 'Tiket tidak valid' });
-      
-      const ticket = tickets[0];
-      if (new Date(ticket.expires_at) < new Date() && ticket.status === 'pending') {
-        await db.query('UPDATE password_resets SET status = "expired" WHERE ticket_code = ?', [req.params.ticket]);
-        return res.json({ status: 'expired' });
-      }
+    res.json({ status: ticket.status });
+  } catch (error) {
+    res.status(500).json({ error: 'Gagal mengecek tiket' });
+  }
+});
 
-      res.json({ status: ticket.status });
-    } catch (error) {
-      res.status(500).json({ error: 'Gagal mengecek tiket' });
-    }
-  });
+// 3. USER: Eksekusi Ganti Password (Jika tiket Approved)
+app.post('/api/auth/execute-reset', async (req, res) => {
+  try {
+    const { ticket, newPassword } = req.body;
+    const [tickets]: any = await db.query(
+      'SELECT user_id, status FROM password_resets WHERE ticket_code = ?', [ticket]
+    );
 
-  // 3. USER: Eksekusi Ganti Password (Jika tiket Approved)
-  app.post('/api/auth/execute-reset', async (req, res) => {
-    try {
-      const { ticket, newPassword } = req.body;
-      const [tickets]: any = await db.query(
-        'SELECT user_id, status FROM password_resets WHERE ticket_code = ?', [ticket]
-      );
-      
-      if (tickets.length === 0) return res.status(404).json({ error: 'Tiket tidak valid' });
-      if (tickets[0].status !== 'approved') return res.status(403).json({ error: 'Tiket belum disetujui atau sudah hangus' });
+    if (tickets.length === 0) return res.status(404).json({ error: 'Tiket tidak valid' });
+    if (tickets[0].status !== 'approved') return res.status(403).json({ error: 'Tiket belum disetujui atau sudah hangus' });
 
-      // Hash password baru menggunakan bcryptjs dari scope atas file
-      const hashedPassword = await bcrypt.hash(newPassword, 10);
+    // Hash password baru menggunakan bcryptjs dari scope atas file
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
 
-      // Update password user & hanguskan tiket
-      await db.query('UPDATE Users SET password = ? WHERE id = ?', [hashedPassword, tickets[0].user_id]);
-      await db.query('UPDATE password_resets SET status = "used" WHERE ticket_code = ?', [ticket]);
+    // Update password user & hanguskan tiket
+    await db.query('UPDATE Users SET password = ? WHERE id = ?', [hashedPassword, tickets[0].user_id]);
+    await db.query('UPDATE password_resets SET status = "used" WHERE ticket_code = ?', [ticket]);
 
-      res.json({ message: 'Password berhasil diubah. Silakan login.' });
-    } catch (error) {
-      console.error('[EXECUTE RESET ERROR]', error);
-      res.status(500).json({ error: 'Gagal mereset password' });
-    }
-  });
+    res.json({ message: 'Password berhasil diubah. Silakan login.' });
+  } catch (error) {
+    console.error('[EXECUTE RESET ERROR]', error);
+    res.status(500).json({ error: 'Gagal mereset password' });
+  }
+});
 
-  // 4. ADMIN: Ambil Semua Tiket
-  app.get('/api/admin/password-tickets', async (req, res) => {
-    try {
-      const [tickets]: any = await db.query(`
+// 4. ADMIN: Ambil Semua Tiket
+app.get('/api/admin/password-tickets', async (req, res) => {
+  try {
+    const [tickets]: any = await db.query(`
         SELECT p.*, u.email, u.firstName, u.lastName 
         FROM password_resets p 
         JOIN Users u ON p.user_id = u.id 
         ORDER BY p.created_at DESC
       `);
-      res.json(tickets);
-    } catch (error) {
-      res.status(500).json({ error: 'Gagal mengambil data tiket' });
-    }
-  });
+    res.json(tickets);
+  } catch (error) {
+    res.status(500).json({ error: 'Gagal mengambil data tiket' });
+  }
+});
 
-  // 5. ADMIN: Setujui (Approve) Tiket
-  app.put('/api/admin/password-tickets/:id/approve', async (req, res) => {
-    try {
-      await db.query('UPDATE password_resets SET status = "approved" WHERE id = ?', [req.params.id]);
-      res.json({ message: 'Tiket disetujui' });
-    } catch (error) {
-      res.status(500).json({ error: 'Gagal menyetujui tiket' });
-    }
-  });
+// 5. ADMIN: Setujui (Approve) Tiket
+app.put('/api/admin/password-tickets/:id/approve', async (req, res) => {
+  try {
+    await db.query('UPDATE password_resets SET status = "approved" WHERE id = ?', [req.params.id]);
+    res.json({ message: 'Tiket disetujui' });
+  } catch (error) {
+    res.status(500).json({ error: 'Gagal menyetujui tiket' });
+  }
+});
 
-  // ==========================================
-  // --- TAHAP 3: API PENGATURAN PROFIL & AVATAR ---
-  // ==========================================
+// ==========================================
+// --- TAHAP 3: API PENGATURAN PROFIL & AVATAR ---
+// ==========================================
 
-  // 1. GET: Ambil Data Profil User Saat Ini
-  app.get('/api/user/profile', authenticate, async (req: any, res) => {
-    try {
-      const [users]: any = await db.query(
-        'SELECT id, email, firstName, lastName, avatar_url FROM users WHERE id = ?', 
-        [req.user.id]
+// 1. GET: Ambil Data Profil User Saat Ini
+app.get('/api/user/profile', authenticate, async (req: any, res) => {
+  try {
+    const [users]: any = await db.query(
+      'SELECT id, email, firstName, lastName, avatar_url FROM users WHERE id = ?',
+      [req.user.id]
+    );
+    if (users.length === 0) return res.status(404).json({ error: 'User tidak ditemukan' });
+    res.json(users[0]);
+  } catch (error) {
+    console.error('[GET PROFILE ERROR]', error);
+    res.status(500).json({ error: 'Gagal mengambil data profil' });
+  }
+});
+
+// 2. PUT: Update Data Teks Profil & Password
+app.put('/api/user/profile', authenticate, async (req: any, res) => {
+  try {
+    const { firstName, lastName, email, currentPassword, newPassword } = req.body;
+    const userId = req.user.id;
+
+    // Jika user ingin ganti password, wajib validasi password lama
+    if (newPassword && currentPassword) {
+      const [users]: any = await db.query('SELECT password FROM users WHERE id = ?', [userId]);
+      const isMatch = await bcrypt.compare(currentPassword, users[0].password);
+
+      if (!isMatch) return res.status(400).json({ error: 'Password saat ini salah!' });
+
+      const hashedPassword = await bcrypt.hash(newPassword, 10);
+      await db.query(
+        'UPDATE users SET firstName = ?, lastName = ?, email = ?, password = ? WHERE id = ?',
+        [firstName, lastName, email, hashedPassword, userId]
       );
-      if (users.length === 0) return res.status(404).json({ error: 'User tidak ditemukan' });
-      res.json(users[0]);
-    } catch (error) {
-      console.error('[GET PROFILE ERROR]', error);
-      res.status(500).json({ error: 'Gagal mengambil data profil' });
+    } else {
+      // Update profil biasa tanpa ganti password
+      await db.query(
+        'UPDATE users SET firstName = ?, lastName = ?, email = ? WHERE id = ?',
+        [firstName, lastName, email, userId]
+      );
     }
-  });
+    res.json({ message: 'Profil berhasil diperbarui' });
+  } catch (error) {
+    console.error('[UPDATE PROFILE ERROR]', error);
+    res.status(500).json({ error: 'Gagal memperbarui profil' });
+  }
+});
 
-  // 2. PUT: Update Data Teks Profil & Password
-  app.put('/api/user/profile', authenticate, async (req: any, res) => {
-    try {
-      const { firstName, lastName, email, currentPassword, newPassword } = req.body;
-      const userId = req.user.id;
+// 3. POST: Upload Foto Profil (Avatar)
+app.post('/api/user/avatar', authenticate, (req: any, res: any, next: any) => {
+  uploadAvatar.single('avatar')(req, res, next);
+}, async (req: any, res: any) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'Tidak ada file gambar yang diunggah' });
 
-      // Jika user ingin ganti password, wajib validasi password lama
-      if (newPassword && currentPassword) {
-        const [users]: any = await db.query('SELECT password FROM users WHERE id = ?', [userId]);
-        const isMatch = await bcrypt.compare(currentPassword, users[0].password);
-        
-        if (!isMatch) return res.status(400).json({ error: 'Password saat ini salah!' });
-        
-        const hashedPassword = await bcrypt.hash(newPassword, 10);
-        await db.query(
-          'UPDATE users SET firstName = ?, lastName = ?, email = ?, password = ? WHERE id = ?', 
-          [firstName, lastName, email, hashedPassword, userId]
-        );
-      } else {
-        // Update profil biasa tanpa ganti password
-        await db.query(
-          'UPDATE users SET firstName = ?, lastName = ?, email = ? WHERE id = ?', 
-          [firstName, lastName, email, userId]
-        );
-      }
-      res.json({ message: 'Profil berhasil diperbarui' });
-    } catch (error) {
-      console.error('[UPDATE PROFILE ERROR]', error);
-      res.status(500).json({ error: 'Gagal memperbarui profil' });
-    }
-  });
+    const avatarUrl = '/uploads/avatars/' + req.file.filename;
+    await db.query('UPDATE users SET avatar_url = ? WHERE id = ?', [avatarUrl, req.user.id]);
 
-  // 3. POST: Upload Foto Profil (Avatar)
-  app.post('/api/user/avatar', authenticate, (req: any, res: any, next: any) => {
-    uploadAvatar.single('avatar')(req, res, next);
-  }, async (req: any, res: any) => {
-    try {
-      if (!req.file) return res.status(400).json({ error: 'Tidak ada file gambar yang diunggah' });
-      
-      const avatarUrl = '/uploads/avatars/' + req.file.filename;
-      await db.query('UPDATE users SET avatar_url = ? WHERE id = ?', [avatarUrl, req.user.id]);
-      
-      res.json({ message: 'Foto profil berhasil diperbarui', avatar_url: avatarUrl });
-    } catch (error) {
-      console.error('[UPLOAD AVATAR ERROR]', error);
-      res.status(500).json({ error: 'Gagal mengunggah foto profil' });
-    }
-  });
+    res.json({ message: 'Foto profil berhasil diperbarui', avatar_url: avatarUrl });
+  } catch (error) {
+    console.error('[UPLOAD AVATAR ERROR]', error);
+    res.status(500).json({ error: 'Gagal mengunggah foto profil' });
+  }
+});
 
 // --- Studio & Video Management Routes ---
 /**
@@ -2165,14 +2168,14 @@ app.get('/api/studio/videos', authenticate, async (req: any, res) => {
       WHERE v.user_id = ? AND v.deleted_at IS NULL
       ORDER BY v.created_at DESC
     `, [req.user.id]);
-    
+
     // Cast watch_time explicitly to guarantee number processing
     const processedVideos = videos.map((v: any) => ({
       ...v,
       watch_time: Number(v.watch_time) || 0,
       views: Number(v.views) || 0
     }));
-    
+
     res.json(processedVideos);
   } catch (error) {
     console.error('Fetch studio videos error:', error);
@@ -2187,7 +2190,7 @@ app.post('/api/videos/draft', authenticate, async (req: any, res) => {
   console.log('[API CALL] ' + req.originalUrl);
   try {
     const { title, description, allowDownload, student_name, program_id, meeting_number, session_date, teacher_note, teacherNote } = req.body;
-    
+
     // Helper sanitasi integer aman dari string 'undefined' / 'null' / NaN
     const parseSafeInt = (val: any): number | null => {
       if (!val || val === 'undefined' || val === 'null' || isNaN(Number(val))) return null;
@@ -2213,10 +2216,10 @@ app.post('/api/videos/draft', authenticate, async (req: any, res) => {
       `SELECT id FROM Videos WHERE user_id = ? AND title = ? AND created_at >= NOW() - INTERVAL 1 MINUTE LIMIT 1`,
       [req.user.id, title || 'Untitled']
     );
-    
+
     if (existing && existing.length > 0) {
       if (safeTeacherNote) {
-        await db.execute('UPDATE Videos SET teacher_note = ? WHERE id = ?', [safeTeacherNote, existing[0].id]).catch(() => {});
+        await db.execute('UPDATE Videos SET teacher_note = ? WHERE id = ?', [safeTeacherNote, existing[0].id]).catch(() => { });
       }
       return res.json({ id: existing[0].id, uploadId: Date.now().toString() });
     }
@@ -2225,10 +2228,10 @@ app.post('/api/videos/draft', authenticate, async (req: any, res) => {
     const [result]: any = await db.execute(
       'INSERT INTO Videos (user_id, title, description, status, allow_download, student_name, program_id, meeting_number, session_date, upload_id, teacher_note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [
-        req.user.id, 
-        title || 'Untitled', 
-        description || '', 
-        'pending', 
+        req.user.id,
+        title || 'Untitled',
+        description || '',
+        'pending',
         allowDownload ? 1 : 0,
         student_name?.trim() || null,
         safeProgramId,
@@ -2253,7 +2256,7 @@ const upload = multer({
   fileFilter: (req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
     const allowedExtensions = ['.mp4', '.mov', '.ts', '.mpeg', '.m4v'];
-    
+
     // Daftar MIME yang sah (Termasuk penangkal jebakan TypeScript .ts)
     const allowedMimes = [
       'video/mp4',
@@ -2353,7 +2356,7 @@ app.get('/api/video/encoding-status/:uploadId', async (req, res) => {
       finalStatus = 'processing';
     }
 
-    res.json({ 
+    res.json({
       encodingProgress: progress,
       status: finalStatus
     });
@@ -2376,7 +2379,7 @@ app.post('/api/upload/chunk', authenticate, upload.single('chunk'), async (req: 
   console.log('[API CALL] ' + req.originalUrl);
   try {
     const { chunkIndex, totalChunks, fileName, uploadId, videoId } = req.body;
-    
+
     const chunkPath = path.join(CHUNK_DIR, `${uploadId}_${chunkIndex}`);
     fs.renameSync(req.file.path, chunkPath);
 
@@ -2402,46 +2405,46 @@ app.post('/api/upload/chunk', authenticate, upload.single('chunk'), async (req: 
 
       const finalPath = path.join(UPLOAD_DIR, `${uploadId}_${fileName}`);
       const writeStream = fs.createWriteStream(finalPath);
-      
+
       const mergeNextChunk = (index: number) => {
         if (index >= parseInt(totalChunks)) {
           writeStream.end();
           return;
         }
-        
+
         const chunkFile = path.join(CHUNK_DIR, `${uploadId}_${index}`);
         const stat = fs.statSync(chunkFile);
         if (!stat.isFile()) {
-          return; 
+          return;
         }
         const readStream = fs.createReadStream(chunkFile);
-        
+
         readStream.pipe(writeStream, { end: false });
-        
+
         readStream.on('end', () => {
           try { fs.unlinkSync(chunkFile); } catch (e) { /* ignore */ }
           mergeNextChunk(index + 1);
         });
-        
+
         readStream.on('error', (err) => {
           console.error(`[STREAM] Error reading chunk ${index}:`, err);
           writeStream.end();
         });
       };
-      
+
       mergeNextChunk(0);
-      
+
       writeStream.on('finish', async () => {
         // Place video into the Backend Decoding Queue visually and structurally
         // Apply Binar Obfuscation here
         const omniPath = finalPath + '.omni';
         fs.renameSync(finalPath, omniPath);
         obfuscateFileInPlace(omniPath);
-        
+
         await db.execute('UPDATE Videos SET url = ?, status = ? WHERE id = ?', [`/uploads/${uploadId}_${fileName}`, 'waiting', videoId]);
-        
+
         io.emit('video-progress-' + videoId, { status: 'waiting' });
-        
+
         // Masukkan ke Fair-Share Multi-Tenant GPU Transcoding Scheduler
         const vidIdInt = parseInt(videoId);
         queueTranscodeJob({
@@ -2460,7 +2463,7 @@ app.post('/api/upload/chunk', authenticate, upload.single('chunk'), async (req: 
         const initialStatus = activeTranscodingJobs.has(vidIdInt) ? 'processing' : 'waiting';
         return res.json({ status: initialStatus });
       });
-      
+
     } else {
       res.json({ status: 'uploading' });
     }
@@ -2482,9 +2485,9 @@ app.post('/api/videos/upload', authenticate, upload.single('video'), async (req:
     let sanitizedTitle = 'Untitled_Video';
 
     if (req.file) {
-        sanitizedTitle = req.body && req.body.title ? req.body.title.trim() : req.file.originalname;
+      sanitizedTitle = req.body && req.body.title ? req.body.title.trim() : req.file.originalname;
     } else if (req.body && req.body.title) {
-        sanitizedTitle = req.body.title.trim();
+      sanitizedTitle = req.body.title.trim();
     }
 
     // Jika sistem menerima request berupa array/batch, pastikan proses pembacaan title di dalam loop 
@@ -2495,21 +2498,21 @@ app.post('/api/videos/upload', authenticate, upload.single('video'), async (req:
       const [result]: any = await db.execute(
         'INSERT INTO Videos (user_id, title, description, visibility, category_id, allow_download, url, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
         [
-           req.user.id, 
-           sanitizedTitle, 
-           req.body.description || '', 
-           req.body.visibility || 'public', 
-           req.body.categoryId ? parseInt(req.body.categoryId) : 1, 
-           req.body.allowDownload === 'true' || req.body.allowDownload === true ? 1 : 0,
-           `/uploads/${req.file.filename}.omni`, 
-           'processing'
+          req.user.id,
+          sanitizedTitle,
+          req.body.description || '',
+          req.body.visibility || 'public',
+          req.body.categoryId ? parseInt(req.body.categoryId) : 1,
+          req.body.allowDownload === 'true' || req.body.allowDownload === true ? 1 : 0,
+          `/uploads/${req.file.filename}.omni`,
+          'processing'
         ]
       );
-      
+
       const newVideoId = result.insertId;
       console.log(`[SYSTEM] Video baru terdaftar. ID: ${newVideoId}. Memicu pipa NVENC otomatis...`);
       io.emit('video-progress-' + newVideoId, { status: 'waiting' });
-      
+
       // Pemicu Instan: Langsung lemparkan VideoID ke mesin multi-resolution encoding NVENC
       if (typeof processVideo === 'function') {
         const uploadId = req.body.uploadId;
@@ -2522,12 +2525,12 @@ app.post('/api/videos/upload', authenticate, upload.single('video'), async (req:
           isObfuscated: true
         });
       }
-      
+
       // Kirim respons ke frontend bahwa antrean telah diterima dan sedang diproses di background
-      return res.json({ 
-          success: true, 
-          videoId: newVideoId, 
-          message: 'Video berhasil disimpan di drive dan antrean encoding dimulai.' 
+      return res.json({
+        success: true,
+        videoId: newVideoId,
+        message: 'Video berhasil disimpan di drive dan antrean encoding dimulai.'
       });
     } catch (err) {
       console.error('[DATABASE ERROR] Gagal mendaftarkan video baru:', err);
@@ -2553,25 +2556,25 @@ app.patch('/api/videos/:id/thumbnail', authenticate, uploadThumbnail.single('thu
     if (!videos || videos.length === 0) {
       return res.status(404).json({ error: 'Video not found' });
     }
-    
+
     if (req.user.role !== 'admin' && videos[0].user_id !== req.user.id) {
-       return res.status(403).json({ error: 'Unauthorized' });
+      return res.status(403).json({ error: 'Unauthorized' });
     }
 
     const timestamp = Date.now();
     const safeName = req.file.originalname.replace(/[^a-zA-Z0-9.-]/g, '');
     const newFileName = `custom-thumb-${timestamp}-${safeName}`;
     const newPath = path.join(THUMBNAIL_DIR, newFileName);
-    
+
     fs.renameSync(req.file.path, newPath);
-    
+
     const omniPath = newPath + '.omni';
     fs.renameSync(newPath, omniPath);
     obfuscateFileInPlace(omniPath);
-    
+
     const publicUrl = `/thumbnails/${newFileName}`;
     await db.execute('UPDATE Videos SET thumbnail_url = ? WHERE id = ?', [publicUrl, videoId]);
-    
+
     res.json({ success: true, url: publicUrl });
   } catch (error) {
     console.error('Thumbnail upload error:', error);
@@ -2670,10 +2673,10 @@ app.post('/api/videos/bulk-delete', authenticate, async (req: any, res) => {
     // 3. Hapus baris dari MySQL (cascade handles related tables ideally)
     await db.query('DELETE FROM Videos WHERE id IN (?) AND user_id = ?', [videoIds, req.user.id]);
 
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       message: `${videoIds.length} video berhasil dihapus permanen.`,
-      deletedCount: videoIds.length 
+      deletedCount: videoIds.length
     });
   } catch (err) {
     console.error('[BULK DELETE ERROR]:', err);
@@ -2681,88 +2684,88 @@ app.post('/api/videos/bulk-delete', authenticate, async (req: any, res) => {
   }
 });
 
-  app.delete('/api/videos/:id', async (req, res) => {
-    try {
-      const videoId = req.params.id;
-      
-      // 1. Ambil info video sebelum dihapus
-      const [videoRows]: any = await db.query('SELECT * FROM Videos WHERE id = ?', [videoId]);
-      if (videoRows.length === 0) return res.status(404).json({ error: 'Video not found' });
-      const video = videoRows[0];
+app.delete('/api/videos/:id', async (req, res) => {
+  try {
+    const videoId = req.params.id;
 
-      // 2. Siapkan direktori tanggal YYYY/MM/DD
-      const date = new Date();
-      const year = date.getFullYear().toString();
-      const month = String(date.getMonth() + 1).padStart(2, '0');
-      const day = String(date.getDate()).padStart(2, '0');
-      const archivePath = path.join(process.cwd(), 'deleted', year, month, day, videoId.toString());
-      
-      if (!fs.existsSync(archivePath)) {
-        fs.mkdirSync(archivePath, { recursive: true });
-      }
+    // 1. Ambil info video sebelum dihapus
+    const [videoRows]: any = await db.query('SELECT * FROM Videos WHERE id = ?', [videoId]);
+    if (videoRows.length === 0) return res.status(404).json({ error: 'Video not found' });
+    const video = videoRows[0];
 
-      const processedDir = path.join(process.cwd(), 'processed');
-      const filesDir = fs.existsSync(processedDir) ? fs.readdirSync(processedDir) : [];
-      
-      // 3. Cari resolusi terkecil
-      const videoFiles = filesDir.filter(f => f.startsWith(`processed-${videoId}-`) && f.endsWith('.mp4.omni'));
-      let smallestRes = Infinity;
-      let smallestFile = '';
+    // 2. Siapkan direktori tanggal YYYY/MM/DD
+    const date = new Date();
+    const year = date.getFullYear().toString();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    const archivePath = path.join(process.cwd(), 'deleted', year, month, day, videoId.toString());
 
-      videoFiles.forEach(file => {
-        const resMatch = file.match(/-(\d+)\.mp4\.omni$/);
-        if (resMatch) {
-          const res = parseInt(resMatch[1]);
-          if (res < smallestRes) {
-            smallestRes = res;
-            smallestFile = file;
-          }
+    if (!fs.existsSync(archivePath)) {
+      fs.mkdirSync(archivePath, { recursive: true });
+    }
+
+    const processedDir = path.join(process.cwd(), 'processed');
+    const filesDir = fs.existsSync(processedDir) ? fs.readdirSync(processedDir) : [];
+
+    // 3. Cari resolusi terkecil
+    const videoFiles = filesDir.filter(f => f.startsWith(`processed-${videoId}-`) && f.endsWith('.mp4.omni'));
+    let smallestRes = Infinity;
+    let smallestFile = '';
+
+    videoFiles.forEach(file => {
+      const resMatch = file.match(/-(\d+)\.mp4\.omni$/);
+      if (resMatch) {
+        const res = parseInt(resMatch[1]);
+        if (res < smallestRes) {
+          smallestRes = res;
+          smallestFile = file;
         }
-      });
-
-      // 4. Pindah file terkecil, hapus sisanya
-      videoFiles.forEach(file => {
-        const oldPath = path.join(processedDir, file);
-        if (file === smallestFile) {
-          fs.renameSync(oldPath, path.join(archivePath, file)); // Pindah file terkecil
-        } else {
-          fs.unlinkSync(oldPath); // Hapus resolusi besar
-        }
-      });
-
-      // 5. Pindah folder thumbnail
-      const thumbDir = path.join(processedDir, videoId.toString());
-      if (fs.existsSync(thumbDir)) {
-        fs.renameSync(thumbDir, path.join(archivePath, 'thumbnails'));
       }
+    });
 
-      // 6. Masukkan ke tabel arsip (videos_deleted) + 14 Hari Expiry
-      const expiresAt = new Date(date.getTime() + 14 * 24 * 60 * 60 * 1000);
-      await db.query(`
+    // 4. Pindah file terkecil, hapus sisanya
+    videoFiles.forEach(file => {
+      const oldPath = path.join(processedDir, file);
+      if (file === smallestFile) {
+        fs.renameSync(oldPath, path.join(archivePath, file)); // Pindah file terkecil
+      } else {
+        fs.unlinkSync(oldPath); // Hapus resolusi besar
+      }
+    });
+
+    // 5. Pindah folder thumbnail
+    const thumbDir = path.join(processedDir, videoId.toString());
+    if (fs.existsSync(thumbDir)) {
+      fs.renameSync(thumbDir, path.join(archivePath, 'thumbnails'));
+    }
+
+    // 6. Masukkan ke tabel arsip (videos_deleted) + 14 Hari Expiry
+    const expiresAt = new Date(date.getTime() + 14 * 24 * 60 * 60 * 1000);
+    await db.query(`
         INSERT INTO videos_deleted (original_video_id, uploader_id, title, archive_path, expires_at)
         VALUES (?, ?, ?, ?, ?)
       `, [video.id, video.uploader_id || video.user_id, video.title, archivePath, expiresAt]);
 
-      // 7. Hapus dari tabel utama (Cascade akan menghapus komen/like otomatis)
-      await db.query('DELETE FROM Videos WHERE id = ?', [videoId]);
+    // 7. Hapus dari tabel utama (Cascade akan menghapus komen/like otomatis)
+    await db.query('DELETE FROM Videos WHERE id = ?', [videoId]);
 
-      res.json({ message: 'Video berhasil diarsipkan secara otomatis' });
-    } catch (error) {
-      console.error('[DELETE ARCHIVE ERROR]:', error);
-      res.status(500).json({ error: 'Gagal menghapus dan mengarsipkan video' });
-    }
-  });
+    res.json({ message: 'Video berhasil diarsipkan secara otomatis' });
+  } catch (error) {
+    console.error('[DELETE ARCHIVE ERROR]:', error);
+    res.status(500).json({ error: 'Gagal menghapus dan mengarsipkan video' });
+  }
+});
 
-  // --- RUTE KHUSUS ADMIN: DAFTAR ARSIP VIDEO TERHAPUS ---
-  app.get('/api/admin/archives', async (req, res) => {
-    try {
-      const [archives]: any = await db.query('SELECT * FROM videos_deleted ORDER BY deleted_at DESC');
-      res.json(archives);
-    } catch (error) {
-      console.error('[ADMIN ARCHIVE API ERROR]:', error);
-      res.status(500).json({ error: 'Gagal mengambil data arsip dari database' });
-    }
-  });
+// --- RUTE KHUSUS ADMIN: DAFTAR ARSIP VIDEO TERHAPUS ---
+app.get('/api/admin/archives', async (req, res) => {
+  try {
+    const [archives]: any = await db.query('SELECT * FROM videos_deleted ORDER BY deleted_at DESC');
+    res.json(archives);
+  } catch (error) {
+    console.error('[ADMIN ARCHIVE API ERROR]:', error);
+    res.status(500).json({ error: 'Gagal mengambil data arsip dari database' });
+  }
+});
 
 // --- Public Video Routes ---
 // --- YOUTUBE-STYLE SEARCH SUGGESTIONS API (TAHAP 55) ---
@@ -2863,7 +2866,7 @@ app.post('/api/videos/:id/view', optionalAuthenticate, async (req: any, res) => 
 
     // 1. Tambah views di tabel Videos
     await db.execute('UPDATE Videos SET views = COALESCE(views, 0) + 1 WHERE id = ?', [videoId]);
-    
+
     // 2. Catat riwayat di tabel Views
     try {
       await db.execute('INSERT INTO Views (video_id, user_id) VALUES (?, ?)', [videoId, userId]);
@@ -2918,67 +2921,42 @@ app.post('/api/videos/:id/view', optionalAuthenticate, async (req: any, res) => 
   }
 });
 
-const watchSessionBudgets = new Map<string, { lastAtMs: number; budgetSec: number }>();
-
-/**
- * Membatasi penambahan watch time per sesi tontonan agar request ganda atau lonjakan
- * tidak sinkron dari satu penonton tertahan tanpa mengganggu penonton lain yang bersamaan.
- */
-function claimWatchSessionIncrement(sessionId: string | undefined, videoId: number, requestedSeconds: number): number {
-  const clamped = Math.min(Math.max(Math.round(requestedSeconds), 1), 30);
-  if (!sessionId || typeof sessionId !== 'string') {
-    return clamped;
-  }
-
-  const now = Date.now();
-  if (watchSessionBudgets.size > 5000) {
-    const staleBefore = now - 30 * 60 * 1000;
-    for (const [key, entry] of watchSessionBudgets.entries()) {
-      if (entry.lastAtMs < staleBefore) {
-        watchSessionBudgets.delete(key);
-      }
-    }
-  }
-
-  const key = `${sessionId.slice(0, 80)}:${videoId}`;
-  const existing = watchSessionBudgets.get(key);
-  if (!existing) {
-    const allowed = Math.min(clamped, 15);
-    watchSessionBudgets.set(key, { lastAtMs: now, budgetSec: 1 });
-    return allowed;
-  }
-
-  const elapsedSec = Math.max(0, (now - existing.lastAtMs) / 1000);
-  existing.lastAtMs = now;
-  existing.budgetSec = Math.min(15, existing.budgetSec + elapsedSec * 2);
-
-  const allowed = Math.min(clamped, Math.floor(existing.budgetSec));
-  if (allowed < 1) {
-    return 0;
-  }
-  existing.budgetSec -= allowed;
-  return allowed;
-}
-
 app.post('/api/videos/:id/heartbeat', optionalAuthenticate, async (req: any, res) => {
   try {
     const videoId = parseInt(req.params.id, 10);
     if (isNaN(videoId)) return res.status(400).json({ error: 'ID video tidak valid' });
 
-    const rawSeconds = req.body?.seconds ?? req.body?.duration;
-    if (rawSeconds === undefined || rawSeconds === null || rawSeconds === '') {
-      return res.json({ success: true, videoId, addedSeconds: 0 });
+    const validation = validateHeartbeatPayload(req.body);
+    if (!validation.valid) {
+      return res.status(400).json({
+        error: 'Payload watch time tidak valid',
+        reason: validation.ignoreReason,
+        addedSeconds: 0,
+        engine: WATCH_TIME_ENGINE,
+      });
     }
 
-    const parsedSeconds = Number(rawSeconds);
-    if (!Number.isFinite(parsedSeconds) || parsedSeconds <= 0) {
-      return res.json({ success: true, videoId, addedSeconds: 0 });
+    if (validation.ignoreReason) {
+      return res.json({ success: true, videoId, addedSeconds: 0, engine: WATCH_TIME_ENGINE });
     }
 
-    const increment = claimWatchSessionIncrement(req.body?.sessionId, videoId, parsedSeconds);
-    if (increment < 1) {
-      return res.json({ success: true, videoId, addedSeconds: 0, throttled: true });
+    const claim = claimWatchSessionIncrement({
+      sessionId: req.body?.sessionId,
+      fallbackIp: req.ip || req.socket?.remoteAddress,
+      videoId,
+      requestedSeconds: validation.requestedSeconds,
+    });
+    if (claim.allowedSeconds < 1) {
+      return res.json({
+        success: true,
+        videoId,
+        addedSeconds: 0,
+        throttled: true,
+        engine: WATCH_TIME_ENGINE,
+      });
     }
+
+    const increment = claim.allowedSeconds;
     const userId = req.user?.id || null;
 
     const [videoRows]: any = await db.query(
@@ -3055,7 +3033,8 @@ app.post('/api/videos/:id/heartbeat', optionalAuthenticate, async (req: any, res
       success: true,
       videoId,
       addedSeconds: increment,
-      watch_time: latestWatchTime
+      watch_time: latestWatchTime,
+      engine: WATCH_TIME_ENGINE,
     });
   } catch (error) {
     console.error('Heartbeat error:', error);
@@ -3189,7 +3168,7 @@ app.post('/api/videos/:id/like', authenticate, async (req: any, res) => {
     const userId = req.user.id;
 
     const [existing]: any = await db.execute('SELECT * FROM Likes WHERE video_id = ? AND user_id = ?', [videoId, userId]);
-    
+
     if (existing.length > 0) {
       if (existing[0].type === type) {
         await db.execute('DELETE FROM Likes WHERE id = ?', [existing[0].id]);
@@ -3295,7 +3274,7 @@ app.get('/api/videos/:id/analytics', authenticate, async (req: any, res) => {
   try {
     const videoId = req.params.id;
     const userId = req.user.id;
-    
+
     // Auth Check
     let authQuery = "SELECT * FROM Videos WHERE id = ?";
     let authParams = [videoId];
@@ -3304,9 +3283,9 @@ app.get('/api/videos/:id/analytics', authenticate, async (req: any, res) => {
       authParams.push(userId);
     }
     const [videos]: any = await db.execute(authQuery, authParams);
-    
+
     if (videos.length === 0) return res.status(403).json({ error: 'Access Denied' });
-    
+
     // Get total stats (konsisten dengan creator analytics)
     const [stats]: any = await db.execute(`
       SELECT 
@@ -3337,7 +3316,7 @@ app.get('/api/videos/:id/analytics', authenticate, async (req: any, res) => {
         count: Math.floor(Math.random() * 50)
       };
     });
-    
+
     const retention = Array.from({ length: 10 }).map((_, i) => ({
       timestamp: i * 10,
       count: Math.max(0, 100 - i * 10)
@@ -3380,28 +3359,28 @@ app.get('/api/videos/:id/resolutions', async (req, res) => {
   console.log('[API CALL] ' + req.originalUrl);
   try {
     const [rows]: any = await db.execute('SELECT resolution FROM VideoResolutions WHERE video_id = ?', [req.params.id]);
-      // Mapping resolusi sekaligus menimbang ukuran file fisik
-      const resolutionDetails = rows.map((r: any) => {
-        const resValue = r.resolution;
-        let sizeStr = "Unknown Size";
-        try {
-          const filePath = path.join(process.cwd(), 'processed', `processed-${req.params.id}-${resValue}.mp4.omni`);
-          if (fs.existsSync(filePath)) {
-            const stats = fs.statSync(filePath);
-            const sizeInMB = (stats.size / (1024 * 1024)).toFixed(2);
-            sizeStr = `${sizeInMB} MB`;
-          }
-        } catch (err) {
-          console.error('[SIZE CHECK ERROR]', err);
+    // Mapping resolusi sekaligus menimbang ukuran file fisik
+    const resolutionDetails = rows.map((r: any) => {
+      const resValue = r.resolution;
+      let sizeStr = "Unknown Size";
+      try {
+        const filePath = path.join(process.cwd(), 'processed', `processed-${req.params.id}-${resValue}.mp4.omni`);
+        if (fs.existsSync(filePath)) {
+          const stats = fs.statSync(filePath);
+          const sizeInMB = (stats.size / (1024 * 1024)).toFixed(2);
+          sizeStr = `${sizeInMB} MB`;
         }
-        
-        return {
-          res: resValue,
-          size: sizeStr
-        };
-      });
+      } catch (err) {
+        console.error('[SIZE CHECK ERROR]', err);
+      }
 
-      res.status(200).json(resolutionDetails);
+      return {
+        res: resValue,
+        size: sizeStr
+      };
+    });
+
+    res.status(200).json(resolutionDetails);
   } catch (error) {
     console.error('Fetch resolutions error:', error);
     res.status(500).json({ error: 'Failed to fetch resolutions' });
@@ -3427,7 +3406,7 @@ app.get('/api/channels/:id', optionalAuthenticate, async (req: any, res) => {
     if (rows.length === 0) {
       return res.status(404).json({ error: 'Creator not found' });
     }
-    
+
     const user = rows[0];
 
     // Cek jumlah subscriber (dukung tabel Subscriptions dan Follows)
@@ -3442,7 +3421,7 @@ app.get('/api/channels/:id', optionalAuthenticate, async (req: any, res) => {
       try {
         const [followRows]: any = await db.query("SELECT COUNT(*) AS count FROM Follows WHERE following_id = ?", [creatorId]);
         subscriberCount = followRows[0]?.count || 0;
-      } catch (e2) {}
+      } catch (e2) { }
     }
 
     // Cek status subscribe user saat ini
@@ -3461,7 +3440,7 @@ app.get('/api/channels/:id', optionalAuthenticate, async (req: any, res) => {
             [req.user.id, creatorId]
           );
           isSubscribed = myFollow.length > 0;
-        } catch (e2) {}
+        } catch (e2) { }
       }
     }
 
@@ -3503,9 +3482,9 @@ app.post('/api/subscriptions/toggle', authenticate, async (req: any, res) => {
   try {
     const { leaderId } = req.body;
     const followerId = req.user.id;
-    
+
     const [existing]: any = await db.execute('SELECT * FROM Follows WHERE follower_id = ? AND following_id = ?', [followerId, leaderId]);
-    
+
     if (existing.length > 0) {
       await db.execute('DELETE FROM Follows WHERE id = ?', [existing[0].id]);
     } else {
@@ -3626,7 +3605,7 @@ app.get('/api/admin/stats', authenticate, isAdmin, async (req, res) => {
     const topVideos = topRows.map((v: any) => {
       let size = 24.5 * 1024 * 1024;
       if (v.file_path && fs.existsSync(v.file_path)) {
-        try { size = fs.statSync(v.file_path).size; } catch {}
+        try { size = fs.statSync(v.file_path).size; } catch { }
       }
       return {
         id: v.id,
@@ -3652,7 +3631,9 @@ app.get('/api/admin/stats', authenticate, isAdmin, async (req, res) => {
       topVideos,
       storageUsedGB: "12.4 GB",
       systemStatus: "Healthy",
-      activeTranscodes: activeTranscodingJobs.size + transcodeQueue.length
+      activeTranscodes: activeTranscodingJobs.size + transcodeQueue.length,
+      serverStartedAt: SERVER_STARTED_AT,
+      watchTimeEngine: WATCH_TIME_ENGINE
     });
   } catch (error) {
     console.error('Failed to fetch admin stats:', error);
@@ -3828,20 +3809,20 @@ app.post('/api/admin/reset-requests/:id/resolve', authenticate, isAdmin, async (
     const ticketId = req.params.id; // actually id from DB
     const [requests]: any = await db.query('SELECT email FROM password_reset_requests WHERE id = ?', [ticketId]);
     if (requests.length === 0) return res.status(404).json({ error: 'Ticket not found' });
-    
+
     const email = requests[0].email;
     const [users]: any = await db.query('SELECT id FROM Users WHERE email = ?', [email]);
     if (users.length === 0) return res.status(404).json({ error: 'User not found for this email' });
-    
+
     const defaultPassword = 'User!1234@';
     const hash = await bcrypt.hash(defaultPassword, 10);
-    
+
     // Update user password
     await db.execute('UPDATE Users SET password = ? WHERE email = ?', [hash, email]);
-    
+
     // Update ticket status
     await db.execute("UPDATE password_reset_requests SET status = 'resolved', new_password = ? WHERE id = ?", [defaultPassword, ticketId]);
-    
+
     res.json({ message: 'Password reset to default User!1234@' });
   } catch (error) {
     res.status(500).json({ error: 'Failed to resolve request' });
@@ -3851,26 +3832,26 @@ app.post('/api/admin/reset-requests/:id/resolve', authenticate, isAdmin, async (
 app.post('/api/admin/reset-password-execute', authenticate, isAdmin, async (req, res) => {
   try {
     const { ticketId, newPassword } = req.body;
-    
+
     if (!ticketId || !newPassword) {
       return res.status(400).json({ error: 'ticketId and newPassword are required' });
     }
 
     const [requests]: any = await db.query('SELECT email FROM password_reset_requests WHERE id = ?', [ticketId]);
     if (requests.length === 0) return res.status(404).json({ error: 'Ticket not found' });
-    
+
     const email = requests[0].email;
     const [users]: any = await db.query('SELECT id FROM Users WHERE email = ?', [email]);
     if (users.length === 0) return res.status(404).json({ error: 'User not found for this email' });
-    
+
     const hash = await bcrypt.hash(newPassword, 10);
-    
+
     // Update user password
     await db.execute('UPDATE Users SET password = ? WHERE email = ?', [hash, email]);
-    
+
     // Update ticket status
     await db.execute("UPDATE password_reset_requests SET status = 'resolved', new_password = ? WHERE id = ?", [newPassword, ticketId]);
-    
+
     res.json({ message: 'Password successfully reset' });
   } catch (error) {
     console.error('Password manual reset error:', error);
@@ -3893,7 +3874,7 @@ app.get('/api/admin/reset-requests/template', authenticate, isAdmin, async (req,
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Template");
     const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
-    
+
     res.setHeader('Content-Disposition', 'attachment; filename="Template_Reset_Password.xlsx"');
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.send(buffer);
@@ -3918,7 +3899,7 @@ app.post('/api/admin/reset-requests/import', authenticate, isAdmin, upload.singl
     for (let i = 0; i < data.length; i++) {
       const row: any = data[i];
       const rowNum = i + 2; // Assuming header is row 1
-      
+
       const nama = row['Nama Lengkap'] || row['NAMA LENGKAP'] || '';
       const jabatan = row['Jabatan (atau Pangkat)'] || row['JABATAN'] || '';
       const nrpRaw = row['NRP'] || '';
@@ -3927,27 +3908,27 @@ app.post('/api/admin/reset-requests/import', authenticate, isAdmin, upload.singl
       const prioritas = row['Prioritas'] || row['PRIORITAS'] || '';
 
       if (!jabatan) {
-         errors.push(`Baris ${rowNum}: JABATAN KOSONG`);
-         continue;
+        errors.push(`Baris ${rowNum}: JABATAN KOSONG`);
+        continue;
       }
       if (!nrp) {
-         errors.push(`Baris ${rowNum}: NRP KOSONG`);
-         continue;
+        errors.push(`Baris ${rowNum}: NRP KOSONG`);
+        continue;
       }
       if (!nama) {
-         errors.push(`Baris ${rowNum}: NAMA KOSONG`);
-         continue;
+        errors.push(`Baris ${rowNum}: NAMA KOSONG`);
+        continue;
       }
 
       // Check duplicates
       const [existingNrp]: any = await db.query('SELECT id FROM password_reset_requests WHERE nrp = ? AND status = "pending"', [nrp]);
       if (existingNrp && existingNrp.length > 0) {
-         errors.push(`Baris ${rowNum}: NRP DUPLIKAT`);
-         continue;
+        errors.push(`Baris ${rowNum}: NRP DUPLIKAT`);
+        continue;
       }
 
       const ticketId = 'OMNI-' + Math.random().toString(36).substr(2, 6).toUpperCase();
-      
+
       // Auto inject values (waktu request, status default)
       await db.execute(
         `INSERT INTO password_reset_requests 
@@ -3958,14 +3939,14 @@ app.post('/api/admin/reset-requests/import', authenticate, isAdmin, upload.singl
       successCount++;
     }
 
-    try { fs.unlinkSync(req.file.path); } catch (e) {}
+    try { fs.unlinkSync(req.file.path); } catch (e) { }
 
     res.json({ message: `Selesai diimpor. ${successCount} berhasil.`, errors, successCount });
 
   } catch (err: any) {
     console.error('Import error:', err);
     if (req.file && fs.existsSync(req.file.path)) {
-       try { fs.unlinkSync(req.file.path); } catch (e) {}
+      try { fs.unlinkSync(req.file.path); } catch (e) { }
     }
     res.status(500).json({ error: 'Failed to import data', details: err.message });
   }
@@ -3975,7 +3956,7 @@ app.post('/api/admin/users', authenticate, isAdmin, async (req, res) => {
   try {
     const { email, password, firstName, lastName, role } = req.body;
     const hash = await bcrypt.hash(password, 10);
-    await db.execute('INSERT INTO Users (email, password, firstName, lastName, role) VALUES (?, ?, ?, ?, ?)', 
+    await db.execute('INSERT INTO Users (email, password, firstName, lastName, role) VALUES (?, ?, ?, ?, ?)',
       [email, hash, firstName, lastName, role || 'user']);
     res.json({ success: true });
   } catch (error) {
@@ -4008,10 +3989,10 @@ const updateUserHandler = async (req: any, res: any) => {
     const is_blocked = typeof req.body.is_blocked === 'boolean' ? req.body.is_blocked : req.body.isBlocked;
 
     if (role || firstName || lastName) {
-      await db.execute('UPDATE Users SET role = COALESCE(?, role), firstName = COALESCE(?, firstName), lastName = COALESCE(?, lastName) WHERE id = ?', 
+      await db.execute('UPDATE Users SET role = COALESCE(?, role), firstName = COALESCE(?, firstName), lastName = COALESCE(?, lastName) WHERE id = ?',
         [role, firstName, lastName, userId]);
     }
-    
+
     if (password) {
       const hash = await bcrypt.hash(password, 10);
       await db.execute('UPDATE Users SET password = ? WHERE id = ?', [hash, userId]);
@@ -4054,18 +4035,18 @@ app.delete('/api/admin/users/:id', authenticate, isAdmin, async (req: any, res) 
       }
 
       if (video.url) {
-         if (video.url.startsWith('/uploads/')) filesToDelete.push(path.join(UPLOAD_DIR, path.basename(video.url)));
-         else if (video.url.startsWith('/processed/')) filesToDelete.push(path.join(PROCESSED_DIR, path.basename(video.url)));
+        if (video.url.startsWith('/uploads/')) filesToDelete.push(path.join(UPLOAD_DIR, path.basename(video.url)));
+        else if (video.url.startsWith('/processed/')) filesToDelete.push(path.join(PROCESSED_DIR, path.basename(video.url)));
       }
 
       if (video.thumbnail_url) {
-         if (video.thumbnail_url.startsWith('/thumbnails/')) filesToDelete.push(path.join(THUMBNAIL_DIR, path.basename(video.thumbnail_url)));
+        if (video.thumbnail_url.startsWith('/thumbnails/')) filesToDelete.push(path.join(THUMBNAIL_DIR, path.basename(video.thumbnail_url)));
       }
 
       const uniqueFilesToDelete = [...new Set(filesToDelete)];
 
       for (const filePath of uniqueFilesToDelete) {
-        try { await fs.promises.unlink(filePath); } catch (e) {}
+        try { await fs.promises.unlink(filePath); } catch (e) { }
       }
     }
 
@@ -4206,12 +4187,12 @@ app.delete('/api/admin/video/:id', authenticate, isAdmin, async (req: any, res) 
     }
 
     if (video.url) {
-       if (video.url.startsWith('/uploads/')) filesToDelete.push(path.join(UPLOAD_DIR, path.basename(video.url)));
-       else if (video.url.startsWith('/processed/')) filesToDelete.push(path.join(PROCESSED_DIR, path.basename(video.url)));
+      if (video.url.startsWith('/uploads/')) filesToDelete.push(path.join(UPLOAD_DIR, path.basename(video.url)));
+      else if (video.url.startsWith('/processed/')) filesToDelete.push(path.join(PROCESSED_DIR, path.basename(video.url)));
     }
 
     if (video.thumbnail_url) {
-       if (video.thumbnail_url.startsWith('/thumbnails/')) filesToDelete.push(path.join(THUMBNAIL_DIR, path.basename(video.thumbnail_url)));
+      if (video.thumbnail_url.startsWith('/thumbnails/')) filesToDelete.push(path.join(THUMBNAIL_DIR, path.basename(video.thumbnail_url)));
     }
 
     const uniqueFilesToDelete = [...new Set(filesToDelete)];
@@ -4246,13 +4227,13 @@ app.get('/api/admin/reports', authenticate, isAdmin, async (req: any, res) => {
         (SELECT COUNT(*) FROM Users) as totalUsers,
         (SELECT COUNT(*) FROM Views) as totalViews
     `);
-    
+
     // Simulate system health metrics for the dashboard
     res.json({
-       health: 'Optimal',
-       totals: stats[0],
-       gpu: hasNVENC ? 'RTX 3050 NVENC Active' : 'CPU Software Mode',
-       uptime: process.uptime()
+      health: 'Optimal',
+      totals: stats[0],
+      gpu: hasNVENC ? 'RTX 3050 NVENC Active' : 'CPU Software Mode',
+      uptime: process.uptime()
     });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch reports' });
@@ -4289,10 +4270,10 @@ app.put('/api/admin/encoding-settings', authenticate, isAdmin, async (req: any, 
 app.get('/api/videos/download/:id/:res', authenticateDownload, async (req: any, res) => {
   try {
     const { id: videoId, res: resolution } = req.params;
-    
+
     const [videos]: any = await db.query('SELECT id, title, url, allow_download, status FROM Videos WHERE id = ?', [videoId]);
     const video = videos[0];
-    
+
     if (!video) return res.status(404).send('Video not found');
     if (video.status !== 'ready') return res.status(403).send('Video is not ready for download');
     if (!video.allow_download && req.user.role !== 'admin') return res.status(403).send('Download is disabled for this video');
@@ -4303,7 +4284,7 @@ app.get('/api/videos/download/:id/:res', authenticateDownload, async (req: any, 
       if (resolutions && resolutions.length > 0 && resolutions[0].url) {
         downloadUrl = resolutions[0].url;
       } else {
-         return res.status(404).send('Resolution not found');
+        return res.status(404).send('Resolution not found');
       }
     }
 
@@ -4332,7 +4313,7 @@ app.get('/api/videos/download/:id/:res', authenticateDownload, async (req: any, 
         if (!res.headersSent) res.status(500).end();
       });
       stream.pipe(res);
-      
+
       req.on('close', () => {
         stream.destroy();
       });
@@ -4351,7 +4332,7 @@ app.get('/api/videos/download/:id/:res', authenticateDownload, async (req: any, 
         if (!res.headersSent) res.status(500).end();
       });
       stream.pipe(res);
-      
+
       // Handle koneksi putus dari browser (ECONNABORTED)
       req.on('close', () => {
         stream.destroy();
@@ -4363,7 +4344,7 @@ app.get('/api/videos/download/:id/:res', authenticateDownload, async (req: any, 
   } catch (error: any) {
     console.error(`[DOWNLOAD_CRITICAL_ERROR] | VideoID: ${req.params.id} | ${error.message}`);
     console.error(error.stack);
-    
+
     if (!res.headersSent) {
       res.status(500).send('Internal Server Error');
     }
@@ -4424,14 +4405,14 @@ async function startServer() {
     const runDBSetup = async () => {
       try {
         await initDB();
-    try {
-      await db.query("ALTER TABLE Videos ADD COLUMN processing_status VARCHAR(50) DEFAULT 'ready'");
-    } catch (e: any) {
-      if (e.code !== 'ER_DUP_FIELDNAME') {
-        console.error('[SYSTEM] Failed to add processing_status column', e);
-      }
-    }
-    await db.query(`CREATE TABLE IF NOT EXISTS password_reset_requests (
+        try {
+          await db.query("ALTER TABLE Videos ADD COLUMN processing_status VARCHAR(50) DEFAULT 'ready'");
+        } catch (e: any) {
+          if (e.code !== 'ER_DUP_FIELDNAME') {
+            console.error('[SYSTEM] Failed to add processing_status column', e);
+          }
+        }
+        await db.query(`CREATE TABLE IF NOT EXISTS password_reset_requests (
       id INT AUTO_INCREMENT PRIMARY KEY,
       ticket_id VARCHAR(50) UNIQUE NOT NULL,
       full_name VARCHAR(100) NOT NULL,
@@ -4442,9 +4423,9 @@ async function startServer() {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
-    // --- TAHAP 61.0: AUTOCREATE PROGRAMS & STUDENT PROGRESS TABLES ---
-    try {
-      await db.query(`
+        // --- TAHAP 61.0: AUTOCREATE PROGRAMS & STUDENT PROGRESS TABLES ---
+        try {
+          await db.query(`
         CREATE TABLE IF NOT EXISTS Programs (
           id INT AUTO_INCREMENT PRIMARY KEY,
           program_name VARCHAR(100) UNIQUE NOT NULL,
@@ -4454,7 +4435,7 @@ async function startServer() {
         )
       `);
 
-      await db.query(`
+          await db.query(`
         CREATE TABLE IF NOT EXISTS StudentProgress (
           id INT AUTO_INCREMENT PRIMARY KEY,
           student_name VARCHAR(100) NOT NULL,
@@ -4466,39 +4447,39 @@ async function startServer() {
         )
       `);
 
-      // Seeding Default Programs jika tabel masih kosong
-      const [existingProgs]: any = await db.query('SELECT COUNT(*) as count FROM Programs');
-      if (existingProgs[0].count === 0) {
-        const defaultPrograms = [
-          // Reset Bulanan
-          ['Arduino Beginner', 'reset_monthly', null],
-          ['Arduino Intermediate', 'reset_monthly', null],
-          ['Arduino IoT', 'reset_monthly', null],
-          ['Robotic Explorer 1', 'reset_monthly', null],
-          ['Robotic Explorer 2', 'reset_monthly', null],
-          // Kontinu
-          ['Web Design', 'continuous', 12],
-          ['Figma', 'continuous', 8],
-          ['Basic Python 1', 'continuous', 10],
-          ['Basic Python 2', 'continuous', 10],
-          ['Java Programming', 'continuous', 24],
-          ['Python Data Analyst', 'continuous', 16],
-          ['Python Machine Learning', 'continuous', 16],
-          ['JavaScript', 'continuous', 12]
-        ];
+          // Seeding Default Programs jika tabel masih kosong
+          const [existingProgs]: any = await db.query('SELECT COUNT(*) as count FROM Programs');
+          if (existingProgs[0].count === 0) {
+            const defaultPrograms = [
+              // Reset Bulanan
+              ['Arduino Beginner', 'reset_monthly', null],
+              ['Arduino Intermediate', 'reset_monthly', null],
+              ['Arduino IoT', 'reset_monthly', null],
+              ['Robotic Explorer 1', 'reset_monthly', null],
+              ['Robotic Explorer 2', 'reset_monthly', null],
+              // Kontinu
+              ['Web Design', 'continuous', 12],
+              ['Figma', 'continuous', 8],
+              ['Basic Python 1', 'continuous', 10],
+              ['Basic Python 2', 'continuous', 10],
+              ['Java Programming', 'continuous', 24],
+              ['Python Data Analyst', 'continuous', 16],
+              ['Python Machine Learning', 'continuous', 16],
+              ['JavaScript', 'continuous', 12]
+            ];
 
-        for (const prog of defaultPrograms) {
-          await db.execute(
-            'INSERT IGNORE INTO Programs (program_name, type, max_quota) VALUES (?, ?, ?)',
-            prog
-          );
+            for (const prog of defaultPrograms) {
+              await db.execute(
+                'INSERT IGNORE INTO Programs (program_name, type, max_quota) VALUES (?, ?, ?)',
+                prog
+              );
+            }
+            console.log('[DB INIT 61.0] Master Data Programs berhasil di-seed otomatis.');
+          }
+          console.log('[DB INIT 61.0] Tabel Programs & StudentProgress terverifikasi aman.');
+        } catch (progDbErr) {
+          console.error('[DB INIT ERROR 61.0] Gagal inisialisasi tabel Programs/StudentProgress:', progDbErr);
         }
-        console.log('[DB INIT 61.0] Master Data Programs berhasil di-seed otomatis.');
-      }
-      console.log('[DB INIT 61.0] Tabel Programs & StudentProgress terverifikasi aman.');
-    } catch (progDbErr) {
-      console.error('[DB INIT ERROR 61.0] Gagal inisialisasi tabel Programs/StudentProgress:', progDbErr);
-    }
       } catch (err: any) {
         console.error('[DATABASE SETUP ERROR]:', err?.message || err);
       }
@@ -4605,14 +4586,14 @@ async function startServer() {
     // -------------------------------------------
 
     // Tambahkan kolom baru untuk template import Excel sesuai instruksi
-    try { await db.query("ALTER TABLE Videos ADD COLUMN thumbnail_url VARCHAR(255)"); } catch (e: any) {}
-    try { await db.query("ALTER TABLE VideoResolutions ADD COLUMN status VARCHAR(50) DEFAULT 'ready'"); } catch (e: any) {}
-    try { await db.query("ALTER TABLE Videos ADD COLUMN status VARCHAR(50) DEFAULT 'processing'"); } catch (e: any) {}
-    try { await db.query("ALTER TABLE Videos ADD COLUMN student_name VARCHAR(255)"); } catch (e: any) {}
-    try { await db.query("ALTER TABLE Videos ADD COLUMN program_id INT"); } catch (e: any) {}
-    try { await db.query("ALTER TABLE Videos ADD COLUMN meeting_number INT"); } catch (e: any) {}
-    try { await db.query("ALTER TABLE Videos ADD COLUMN session_date DATE"); } catch (e: any) {}
-    try { await db.query("ALTER TABLE Videos ADD COLUMN upload_id VARCHAR(255)"); } catch (e: any) {}
+    try { await db.query("ALTER TABLE Videos ADD COLUMN thumbnail_url VARCHAR(255)"); } catch (e: any) { }
+    try { await db.query("ALTER TABLE VideoResolutions ADD COLUMN status VARCHAR(50) DEFAULT 'ready'"); } catch (e: any) { }
+    try { await db.query("ALTER TABLE Videos ADD COLUMN status VARCHAR(50) DEFAULT 'processing'"); } catch (e: any) { }
+    try { await db.query("ALTER TABLE Videos ADD COLUMN student_name VARCHAR(255)"); } catch (e: any) { }
+    try { await db.query("ALTER TABLE Videos ADD COLUMN program_id INT"); } catch (e: any) { }
+    try { await db.query("ALTER TABLE Videos ADD COLUMN meeting_number INT"); } catch (e: any) { }
+    try { await db.query("ALTER TABLE Videos ADD COLUMN session_date DATE"); } catch (e: any) { }
+    try { await db.query("ALTER TABLE Videos ADD COLUMN upload_id VARCHAR(255)"); } catch (e: any) { }
     try {
       await db.query(`
         CREATE TABLE IF NOT EXISTS video_stats (
@@ -4622,8 +4603,8 @@ async function startServer() {
           FOREIGN KEY (video_id) REFERENCES Videos(id) ON DELETE CASCADE
         )
       `);
-    } catch (e: any) {}
-    try { await db.query("ALTER TABLE video_stats ADD COLUMN watch_time_seconds INT DEFAULT 0"); } catch (e: any) {}
+    } catch (e: any) { }
+    try { await db.query("ALTER TABLE video_stats ADD COLUMN watch_time_seconds INT DEFAULT 0"); } catch (e: any) { }
     try {
       await db.query(`
         CREATE TABLE IF NOT EXISTS Subscriptions (
@@ -4634,13 +4615,13 @@ async function startServer() {
           UNIQUE KEY unique_sub (subscriber_id, leader_id)
         )
       `);
-    } catch (e: any) {}
-    try { await db.query("ALTER TABLE password_reset_requests ADD COLUMN jabatan VARCHAR(255)"); } catch (e: any) {}
-    try { await db.query("ALTER TABLE password_reset_requests ADD COLUMN nrp VARCHAR(255)"); } catch (e: any) {}
-    try { await db.query("ALTER TABLE password_reset_requests ADD COLUMN kesatuan VARCHAR(255)"); } catch (e: any) {}
-    try { await db.query("ALTER TABLE password_reset_requests ADD COLUMN prioritas VARCHAR(50)"); } catch (e: any) {}
-    try { await db.query("ALTER TABLE Videos ADD COLUMN file_path VARCHAR(255)"); } catch (e: any) {}
-    
+    } catch (e: any) { }
+    try { await db.query("ALTER TABLE password_reset_requests ADD COLUMN jabatan VARCHAR(255)"); } catch (e: any) { }
+    try { await db.query("ALTER TABLE password_reset_requests ADD COLUMN nrp VARCHAR(255)"); } catch (e: any) { }
+    try { await db.query("ALTER TABLE password_reset_requests ADD COLUMN kesatuan VARCHAR(255)"); } catch (e: any) { }
+    try { await db.query("ALTER TABLE password_reset_requests ADD COLUMN prioritas VARCHAR(50)"); } catch (e: any) { }
+    try { await db.query("ALTER TABLE Videos ADD COLUMN file_path VARCHAR(255)"); } catch (e: any) { }
+
   } catch (err) {
     console.error('[SYSTEM] Database initialization deferred (background retry):', err);
   }
@@ -4670,7 +4651,7 @@ async function startServer() {
         const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
         const chunksize = (end - start) + 1;
         const file = fs.createReadStream(filePath, { start, end });
-        
+
         res.writeHead(206, {
           'Content-Range': `bytes ${start}-${end}/${fileSize}`,
           'Accept-Ranges': 'bytes',
@@ -4695,7 +4676,7 @@ async function startServer() {
             callback();
           }
         });
-        
+
         file.on('error', (err) => {
           console.error(`[STREAM FAIL] Gagal membaca target video: ${err.message}`);
           if (!res.headersSent) res.status(500).end();
@@ -4706,7 +4687,7 @@ async function startServer() {
           'Content-Length': fileSize,
           'Content-Type': 'video/mp4',
         });
-        
+
         let currentStreamOffset = 0;
         const deobfuscateStream = new Transform({
           transform(chunk, encoding, callback) {
@@ -4742,7 +4723,7 @@ async function startServer() {
     try {
       const videoId = req.params.id;
       let rawRes = String(req.query.res || 'original').toLowerCase();
-      
+
       // Ambil metadata video dari database
       const [videoRows]: any = await db.query('SELECT title, url, allow_download FROM Videos WHERE id = ?', [videoId]);
       if (videoRows.length === 0) {
@@ -4768,7 +4749,7 @@ async function startServer() {
         }
         candidates.push(`processed-${videoId}-${rawRes}.mp4.omni`);
       }
-      
+
       // Fallback resolusi bertingkat jika file spesifik tidak ditemukan
       candidates.push(`processed-${videoId}-1080p.mp4.omni`);
       candidates.push(`processed-${videoId}-720p.mp4.omni`);
@@ -4835,14 +4816,14 @@ async function startServer() {
     const hostHeader = req.headers.host || '';
     const hostOnly = hostHeader.split(':')[0] || 'localhost';
     const serverHost = (hostOnly === '127.0.0.1' || hostOnly === '::1') ? 'localhost' : hostOnly;
-    
+
     let currentUserId = currentLiveConfig.userId || 1;
     const authHeader = req.headers.authorization;
     if (authHeader && authHeader.startsWith('Bearer ')) {
       try {
         const decoded: any = jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
         if (decoded?.id) currentUserId = decoded.id;
-      } catch (e) {}
+      } catch (e) { }
     }
 
     res.json({
@@ -4867,10 +4848,10 @@ async function startServer() {
       if (title && typeof title === 'string') currentLiveConfig.title = title.trim();
       if (description && typeof description === 'string') currentLiveConfig.description = description.trim();
       currentLiveConfig.userId = req.user.id;
-      
+
       // Jika saat ini siaran live sedang berlangsung, perbarui juga data di tabel Videos
       if (currentLiveVideoId && title) {
-        await db.query("UPDATE Videos SET title = ?, description = ? WHERE id = ?", [title.trim(), description || '', currentLiveVideoId]).catch(() => {});
+        await db.query("UPDATE Videos SET title = ?, description = ? WHERE id = ?", [title.trim(), description || '', currentLiveVideoId]).catch(() => { });
       }
 
       res.json({ success: true, config: currentLiveConfig });
@@ -4885,14 +4866,14 @@ async function startServer() {
     if (!streamKey) return res.status(400).json({ error: 'StreamKey dibutuhkan' });
 
     const streamFolder = path.join(__dirname, 'public', 'live', streamKey);
-    
+
     // Hapus pecahan file .ts jika folder ada (mencegah penumpukan penyimpanan)
     if (fs.existsSync(streamFolder)) {
       fs.readdir(streamFolder, (err, files) => {
         if (!err && files) {
           files.forEach(file => {
             if (file.endsWith('.ts')) {
-              fs.unlink(path.join(streamFolder, file), () => {});
+              fs.unlink(path.join(streamFolder, file), () => { });
             }
           });
         }
@@ -5014,7 +4995,7 @@ async function startServer() {
     try {
       const streamPath = (typeof session === 'string') ? session : (session?.streamPath || '');
       const streamKey = (typeof session === 'object' && session?.streamName) ? session.streamName : (streamPath.split('/').pop() || 'stream_key_wiji_hub');
-      
+
       console.log(`[LIVE SYSTEM] Stream Terdeteksi Aktif! Key: ${streamKey}, Path: ${streamPath}`);
       isStreamActive = true;
       currentStreamKey = streamKey;
@@ -5024,7 +5005,7 @@ async function startServer() {
       const hlsPlayUrl = `/live/${streamKey}/index.m3u8`;
       const liveTitle = currentLiveConfig.title || `Live Stream - ${new Date().toLocaleDateString('id-ID')}`;
       const liveDesc = currentLiveConfig.description || 'Siaran langsung dari OmniHub Live Studio';
-      
+
       let streamUserId = currentLiveConfig.userId || 1;
       const keyUserMatch = streamKey.match(/stream_key_(?:user_)?(\d+)/);
       if (keyUserMatch) {
@@ -5040,11 +5021,11 @@ async function startServer() {
       currentLiveVideoId = insertResult.insertId;
       console.log(`[DATABASE] Live Stream terdaftar di MySQL dengan VideoID: ${currentLiveVideoId}`);
 
-      io.emit('live-status', { 
-        isLive: true, 
-        videoId: currentLiveVideoId, 
-        streamKey, 
-        title: liveTitle 
+      io.emit('live-status', {
+        isLive: true,
+        videoId: currentLiveVideoId,
+        streamKey,
+        title: liveTitle
       });
 
       if (typeof (global as any).renderDashboard === 'function') (global as any).renderDashboard();
@@ -5080,11 +5061,11 @@ async function startServer() {
       if (!recordedFilePath || !fs.existsSync(recordedFilePath) || fs.statSync(recordedFilePath).size < 100 * 1024) {
         console.log(`[LIVE AUTO-ARCHIVE] File rekaman kosong atau terlalu singkat (< 100 KB). Mengabaikan encoding VOD.`);
         if (currentLiveVideoId) {
-          await db.query("DELETE FROM Videos WHERE id = ? AND status = 'live'", [currentLiveVideoId]).catch(() => {});
+          await db.query("DELETE FROM Videos WHERE id = ? AND status = 'live'", [currentLiveVideoId]).catch(() => { });
           currentLiveVideoId = null;
         }
         if (recordedFilePath && fs.existsSync(recordedFilePath)) {
-          try { fs.unlinkSync(recordedFilePath); } catch (e) {}
+          try { fs.unlinkSync(recordedFilePath); } catch (e) { }
         }
         return;
       }
@@ -5170,10 +5151,10 @@ async function startServer() {
 async function runArchiveCleanup() {
   try {
     const [expiredVideos]: any = await db.query('SELECT * FROM videos_deleted WHERE expires_at <= NOW()');
-    
+
     if (expiredVideos.length > 0) {
       console.log(`[CLEANUP] Menemukan ${expiredVideos.length} video kedaluwarsa. Memulai pembersihan permanen...`);
-      
+
       for (const video of expiredVideos) {
         // Hapus fisik folder YYYY/MM/DD/ID
         if (video.archive_path && fs.existsSync(video.archive_path)) {
